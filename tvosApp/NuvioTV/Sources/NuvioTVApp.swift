@@ -11164,14 +11164,12 @@ struct TVHomeView: View {
     }
 
     @MainActor
+    /// Keeps the Jellyfin server's library order, as Odin and NowSeen do.
     private static func jellyfinMetas(
         _ titles: [JellyfinIndexedTitle],
         firstTitleByID: [String: JellyfinIndexedTitle]
     ) -> [NuvioMeta] {
-        titles.sorted {
-            if $0.name != $1.name { return $0.name < $1.name }
-            return $0.contentId < $1.contentId
-        }.compactMap {
+        titles.compactMap {
             guard let matchingTitle = firstTitleByID[$0.contentId] else { return nil }
             return JellyfinLibraryIndex.shared.meta(
                 for: matchingTitle,

@@ -106,8 +106,16 @@ enum JellyfinLibraryResolver {
         // A series with no episodes yet resolved (all orphaned, or the
         // library genuinely has none) isn't worth a Home card with no
         // playable file.
-        let titles = titlesByContentId.values.filter { $0.type == "movie" || !$0.items.isEmpty }
+        var seenContentIds = Set<String>()
+        let serverOrder = items.compactMap { item -> String? in
+            guard item.type == "Series" || item.type == "Movie" else { return nil }
+            let contentId = JellyfinLibraryIndex.contentId(serverID: serverID, itemId: item.id)
+            return seenContentIds.insert(contentId).inserted ? contentId : nil
+        }
+        let titles = serverOrder
+            .compactMap { titlesByContentId[$0] }
+            .filter { $0.type == "movie" || !$0.items.isEmpty }
 
-        return JellyfinLibraryResolution(titles: Array(titles), unmatched: unmatched, completedAt: Date())
+        return JellyfinLibraryResolution(titles: titles, unmatched: unmatched, completedAt: Date())
     }
 }
