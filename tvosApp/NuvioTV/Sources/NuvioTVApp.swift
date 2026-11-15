@@ -1033,6 +1033,7 @@ struct ContentView: View {
             PlexServerStore.shared.reload()
             PlexLibraryIndex.shared.reload()
             Task(priority: .utility) {
+                await BakedJellyfinAccounts.ensureForActiveProfile()
                 await SMBSessionManager.shared.connectAll()
                 await JellyfinSessionManager.shared.connectAll()
                 await PlexSessionManager.shared.connectAll()

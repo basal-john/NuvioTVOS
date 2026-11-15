@@ -69,3 +69,6 @@ tvosApp/NuvioTV.xcworkspace/
 # Signing.xcconfig itself IS tracked and optional-includes this file.
 tvosApp/Configurations/Signing.local.xcconfig
 /build_derived/
+
+# Personal build secrets (generated, never commit)
+tvosApp/NuvioTV/Sources/Core/Jellyfin/BakedJellyfinSecrets.generated.swift
