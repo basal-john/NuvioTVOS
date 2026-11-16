@@ -103,21 +103,48 @@ enum MdbListListService {
             return nil
         }
 
-        var result: [LibraryStoreItem] = []
+        var seeds: [(index: Int, id: String, type: String, placeholder: NuvioMeta, addedAt: Date)] = []
         for entry in rawItems {
-            let id = providerID(entry.object)
-            guard let id else { continue }
-            let date = date(entry.object) ?? .distantPast
-            let meta: NuvioMeta
-            do {
-                meta = try await repository.getMetadata(id: id.value, type: entry.type)
-            } catch {
-                meta = placeholder(id: id.value, type: entry.type, object: entry.object)
-            }
-            result.append(LibraryStoreItem(meta: meta, addedAt: date))
+            guard let id = providerID(entry.object) else { continue }
+            seeds.append((
+                index: seeds.count,
+                id: id.value,
+                type: entry.type,
+                placeholder: placeholder(id: id.value, type: entry.type, object: entry.object),
+                addedAt: date(entry.object) ?? .distantPast
+            ))
         }
-        return result
+
+        let metas = await withTaskGroup(of: (Int, NuvioMeta).self) { group in
+            var results: [Int: NuvioMeta] = [:]
+            var iterator = seeds.makeIterator()
+            var inFlight = 0
+
+            func addNext() {
+                guard let seed = iterator.next() else { return }
+                inFlight += 1
+                group.addTask {
+                    let meta = (try? await repository.getMetadata(id: seed.id, type: seed.type)) ?? seed.placeholder
+                    return (seed.index, meta)
+                }
+            }
+
+            for _ in 0..<min(metadataConcurrency, seeds.count) { addNext() }
+            while inFlight > 0 {
+                guard let (index, meta) = await group.next() else { break }
+                inFlight -= 1
+                results[index] = meta
+                addNext()
+            }
+            return results
+        }
+
+        return seeds.map { seed in
+            LibraryStoreItem(meta: metas[seed.index] ?? seed.placeholder, addedAt: seed.addedAt)
+        }
     }
+
+    private static let metadataConcurrency = 6
 
     private static func query(cursor: String?) -> [URLQueryItem] {
         var items = [URLQueryItem(name: "limit", value: String(pageSize))]

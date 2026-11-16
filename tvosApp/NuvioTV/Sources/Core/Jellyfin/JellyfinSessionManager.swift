@@ -361,6 +361,9 @@ final class JellyfinSessionManager: ObservableObject {
 
     nonisolated static let foregroundAutoSyncInterval: TimeInterval = 6 * 3600
     nonisolated static let launchAutoSyncCooldown: TimeInterval = 60
+    /// Posted with the server id once a server's library list is known, so
+    /// Home can order Jellyfin rows the way the server lists them.
+    nonisolated static let librariesConnectedNotification = Notification.Name("nuvio.tv.jellyfin.libraries.connected")
 
     @Published private(set) var connectionStates: [String: JellyfinConnectionState] = [:]
     @Published private(set) var syncStates: [String: JellyfinSyncState] = [:]
@@ -483,6 +486,7 @@ final class JellyfinSessionManager: ObservableObject {
             clients[server.id] = client
             connectionProfileIDs[server.id] = profileID
             connectionStates[server.id] = .connected(libraries: libraries)
+            NotificationCenter.default.post(name: Self.librariesConnectedNotification, object: server.id)
         } catch {
             if connectionGenerations[server.id] == generation,
                (ProfileSettings.activeProfileID ?? "default") == profileID,

@@ -703,12 +703,17 @@ public class LibraryViewModel: ObservableObject {
             await refreshSelectedLibrary()
             return
         }
+        items = []
+        isLoading = true
         await loadMdbListListItems(
             listID,
             generation: generation,
             profileID: profileID,
             watchedContext: watchedContext
         )
+        if generation == refreshGeneration {
+            isLoading = false
+        }
     }
 
     private func loadMdbListListItems(

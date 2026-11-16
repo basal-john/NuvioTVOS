@@ -6667,6 +6667,10 @@ struct TVHomeView: View {
             setContinueWatching(rawContinueWatchingItems)
             writeDisplayedContinueWatchingToTopShelf()
         }
+        .onReceive(NotificationCenter.default.publisher(for: JellyfinSessionManager.librariesConnectedNotification).receive(on: RunLoop.main)) { _ in
+            guard isActive && !isFullScreenOverlayPresented else { return }
+            Task { await loadJellyfinSection() }
+        }
         .modifier(CalendarTodayHomeFeed(
             enabled: homeCalendarToday && collectionHome == nil,
             homeReady: store.hasLoaded,
@@ -11136,14 +11140,30 @@ struct TVHomeView: View {
         let groupedTitles = Dictionary(grouping: libraryTitles) {
             JellyfinHomeLibraryKey(serverID: $0.serverID, libraryID: $0.libraryID!)
         }
-        let serverOrder = Dictionary(uniqueKeysWithValues: JellyfinServerStore.shared.servers.enumerated().map {
+        let servers = JellyfinServerStore.shared.servers
+        let serverOrder = Dictionary(uniqueKeysWithValues: servers.enumerated().map {
             ($0.element.id, $0.offset)
         })
+        var libraryOrder: [JellyfinHomeLibraryKey: Int] = [:]
+        for server in servers {
+            let libraryIDs: [String]
+            if case let .connected(libraries) = JellyfinSessionManager.shared.connectionState(for: server.id) {
+                libraryIDs = libraries.map(\.id)
+            } else {
+                libraryIDs = server.selectedLibraryIDs
+            }
+            for (offset, libraryID) in libraryIDs.enumerated() {
+                libraryOrder[JellyfinHomeLibraryKey(serverID: server.id, libraryID: libraryID)] = offset
+            }
+        }
         let orderedKeys = groupedTitles.keys.sorted { lhs, rhs in
             let lhsServerOrder = serverOrder[lhs.serverID] ?? Int.max
             let rhsServerOrder = serverOrder[rhs.serverID] ?? Int.max
             if lhsServerOrder != rhsServerOrder { return lhsServerOrder < rhsServerOrder }
             if lhs.serverID != rhs.serverID { return lhs.serverID < rhs.serverID }
+            let lhsLibraryOrder = libraryOrder[lhs] ?? Int.max
+            let rhsLibraryOrder = libraryOrder[rhs] ?? Int.max
+            if lhsLibraryOrder != rhsLibraryOrder { return lhsLibraryOrder < rhsLibraryOrder }
             let lhsName = groupedTitles[lhs]?.first?.libraryName ?? lhs.libraryID
             let rhsName = groupedTitles[rhs]?.first?.libraryName ?? rhs.libraryID
             if lhsName != rhsName { return lhsName < rhsName }

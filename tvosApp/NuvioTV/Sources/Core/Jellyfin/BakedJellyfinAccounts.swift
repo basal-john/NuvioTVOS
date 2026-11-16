@@ -1,10 +1,14 @@
 import Foundation
 
-/// Personal build addition: adds the baked TweakStreams Jellyfin accounts to
-/// the active profile when they are missing or have no Keychain token, so a
-/// reinstall does not need them typed in again. Existing rows keep their
-/// library selection and sync choice. Credentials come from the gitignored
+/// Personal build addition: adds the baked TweakStreams AioFin account to the
+/// active profile when it is missing or has no Keychain token, so a reinstall
+/// does not need it typed in again. Existing rows keep their library
+/// selection and sync choice. Credentials come from the gitignored
 /// `BakedJellyfinSecrets.generated.swift`.
+///
+/// Also removes rows an earlier build seeded: AioFin on the retired Dubai host
+/// and Aiometa JF, whose 18-library auto-sync never finished and restarted on
+/// every launch.
 enum BakedJellyfinAccounts {
     private struct Account {
         let id: String
@@ -14,29 +18,28 @@ enum BakedJellyfinAccounts {
         let password: String
     }
 
+    private static let retiredServerIDs: Set<String> = ["baked-aiofin", "baked-aiometa"]
+
     private static var accounts: [Account] {
         [
             Account(
-                id: "baked-aiofin",
+                id: "baked-aiofin-hetzner",
                 displayName: "AioFin",
                 url: BakedJellyfinSecrets.aiofinURL,
                 username: BakedJellyfinSecrets.aiofinUsername,
                 password: BakedJellyfinSecrets.aiofinPassword
-            ),
-            Account(
-                id: "baked-aiometa",
-                displayName: "Aiometa JF",
-                url: BakedJellyfinSecrets.aiometaURL,
-                username: BakedJellyfinSecrets.aiometaUsername,
-                password: BakedJellyfinSecrets.aiometaPassword
             )
         ]
     }
 
-    /// Logs in and stores each baked account that the active profile lacks.
+    /// Removes retired rows, then logs in and stores each baked account that
+    /// the active profile lacks.
     @MainActor
     static func ensureForActiveProfile() async {
         let store = JellyfinServerStore.shared
+        for server in store.servers where retiredServerIDs.contains(server.id) {
+            store.remove(server.id)
+        }
         for account in accounts {
             guard !account.url.isEmpty, let baseURL = URL(string: account.url) else { continue }
             let existing = store.servers.first {
