@@ -887,8 +887,10 @@ struct DetailsScreen: View {
             isSmartPlaybackPending = false
             isResolvingDebrid = false
             isPreparingPlayback = false
-            if reload {
-                viewModel.prepareStreams(forId: targetStreamId, type: type)
+            let hasStreamsForTarget = viewModel.requestedStreamId == targetStreamId
+                && (!viewModel.uiState.streams.isEmpty || viewModel.uiState.isLoadingStreams)
+            if reload || !hasStreamsForTarget {
+                viewModel.prepareStreams(forId: targetStreamId, type: type, forceRefresh: forceManualPicker)
             }
             if !viewModel.uiState.streams.isEmpty {
                 let saved = streamDiscoveryDuration ?? (viewModel.prefetchStartTime.map { Date().timeIntervalSince($0) } ?? 0)
