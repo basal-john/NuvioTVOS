@@ -453,6 +453,7 @@ class DetailsViewModel: ObservableObject {
     private(set) var requestedStreamId: String?
 
     private let repository: CatalogRepository
+    private let initialFocusEpisode: DetailsEpisodeFocus?
     private let streamDiscoveryMode: DetailsStreamDiscoveryMode
     private var metadataTask: Task<Void, Never>?
     private var streamObserveTask: Task<Void, Never>?
@@ -474,6 +475,7 @@ class DetailsViewModel: ObservableObject {
 
     init(
         repository: CatalogRepository,
+        initialFocusEpisode: DetailsEpisodeFocus? = nil,
         streamDiscoveryMode: DetailsStreamDiscoveryMode = .shared,
         deferredPreparationDelay: @escaping AsyncDelay = {
             try await Task.sleep(nanoseconds: 350_000_000)
@@ -487,6 +489,7 @@ class DetailsViewModel: ObservableObject {
         }
     ) {
         self.repository = repository
+        self.initialFocusEpisode = initialFocusEpisode
         self.streamDiscoveryMode = streamDiscoveryMode
         self.deferredPreparationDelay = deferredPreparationDelay
         self.injectedEnrichmentStarter = enrichmentStarter
@@ -686,7 +689,8 @@ class DetailsViewModel: ObservableObject {
             let playTarget = TvDetailsPlayTargetBuilder.makePlayTarget(
                 episodes: videos,
                 continueItem: continueItem,
-                watchedKeys: watchedKeys
+                watchedKeys: watchedKeys,
+                focusedEpisode: initialFocusEpisode?.pick(from: videos)
             )
             if let episode = playTarget.episode {
                 let streamId = meta.canonicalEpisodeStreamId(for: episode)

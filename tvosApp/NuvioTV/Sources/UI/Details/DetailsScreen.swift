@@ -265,7 +265,10 @@ struct DetailsScreen: View {
         _pendingStreamPickerResumePosition = State(initialValue: initialStreamPickerResumePosition)
         _isPreparingInitialPlayback = State(initialValue: initialPlaybackRequestID != nil)
         _playbackPrewarmer = State(initialValue: DetailsPlaybackPrewarmer.engineBacked())
-        _viewModel = StateObject(wrappedValue: DetailsViewModel(repository: repository))
+        _viewModel = StateObject(wrappedValue: DetailsViewModel(
+            repository: repository,
+            initialFocusEpisode: initialFocusEpisode
+        ))
         TVHomeDebugTrace.log("details.init id=\(id) type=\(type)")
     }
 
@@ -5287,7 +5290,8 @@ struct TvDetailsContent: View {
                     TvDetailsPlayTargetBuilder.makePlayTarget(
                         episodes: episodes,
                         continueItem: continueItem,
-                        watchedKeys: watchedKeys
+                        watchedKeys: watchedKeys,
+                        focusedEpisode: initialFocusEpisode?.pick(from: episodes)
                     )
                 }
             )
@@ -9048,7 +9052,8 @@ enum TvDetailsPlayTargetBuilder {
     static func makePlayTarget(
         episodes: [NuvioVideo],
         continueItem: ContinueWatchingItem?,
-        watchedKeys: Set<String>
+        watchedKeys: Set<String>,
+        focusedEpisode: NuvioVideo? = nil
     ) -> TvDetailsPlayTarget {
         guard !episodes.isEmpty else {
             return TvDetailsPlayTarget(
@@ -9057,6 +9062,20 @@ enum TvDetailsPlayTargetBuilder {
                     ? L10n.string("action_play", fallback: "Play")
                     : L10n.string("action_resume", fallback: "Resume"),
                 isPlayable: true
+            )
+        }
+
+        if let focusedEpisode,
+           continueItem?.episodeNumbers?.season != focusedEpisode.season
+               || continueItem?.episodeNumbers?.episode != focusedEpisode.episode {
+            let hasAired = EpisodeReleasePolicy.hasAired(focusedEpisode.released)
+            let verb = hasAired
+                ? L10n.string("action_play", fallback: "Play")
+                : L10n.string("details_upcoming", fallback: "Upcoming")
+            return TvDetailsPlayTarget(
+                episode: focusedEpisode,
+                label: "\(verb) \(AniListMetaBuilder.episodeCode(focusedEpisode))",
+                isPlayable: hasAired
             )
         }
 
