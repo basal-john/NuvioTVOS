@@ -137,3 +137,169 @@ struct CalendarTodayHomeFeed: ViewModifier {
         if next != row { row = next }
     }
 }
+
+struct AiringWeekLabel: Equatable, Sendable {
+    let episodeCode: String
+    let episodeTitle: String
+    let badge: String
+    let isOut: Bool
+    let airDate: Date
+}
+
+enum AiringWeekEpisodes {
+    /// The library's exact name.
+    static let libraryName = "Airing This Week"
+    
+    private actor Cache {
+        struct Entry {
+            let label: AiringWeekLabel
+            let expiresAt: Date
+        }
+        var labels: [Int: Entry] = [:]
+        
+        func get(_ id: Int, now: Date) -> AiringWeekLabel? {
+            if let entry = labels[id], entry.expiresAt > now {
+                return entry.label
+            }
+            labels[id] = nil
+            return nil
+        }
+        
+        func set(_ id: Int, label: AiringWeekLabel, expiresAt: Date) {
+            labels[id] = Entry(label: label, expiresAt: expiresAt)
+        }
+    }
+    
+    private static let cache = Cache()
+
+    /// Labels keyed by NuvioMeta.id. Titles with no episode found are left out.
+    /// Fetches concurrently (at most 6 at a time) and caches results in memory for 3 hours per TMDB id.
+    static func labels(for metas: [NuvioMeta], now: Date = Date()) async -> [String: AiringWeekLabel] {
+        guard CalendarLibrarySource.isTmdbConfigured else { return [:] }
+        let client = CalendarLibrarySource.makeClient()
+        let expiresAt = now.addingTimeInterval(3 * 60 * 60)
+        
+        return await withTaskGroup(of: (String, AiringWeekLabel?).self) { group in
+            var activeTasks = 0
+            let maxConcurrent = 6
+            var results: [String: AiringWeekLabel] = [:]
+            
+            for meta in metas {
+                if activeTasks >= maxConcurrent {
+                    if let result = await group.next(), let label = result.1 {
+                        results[result.0] = label
+                    }
+                    activeTasks -= 1
+                }
+                
+                activeTasks += 1
+                group.addTask {
+                    guard let resolved = await TmdbDetailsService.resolveTmdbId(for: meta) else {
+                        return (meta.id, nil)
+                    }
+                    
+                    if let cached = await cache.get(resolved.id, now: now) {
+                        return (meta.id, cached)
+                    }
+                    
+                    guard let details = try? await client.tvDetails(resolved.id) else {
+                        return (meta.id, nil)
+                    }
+                    
+                    let fmt = DateFormatter()
+                    fmt.locale = Locale(identifier: "en_US_POSIX")
+                    fmt.dateFormat = "yyyy-MM-dd"
+                    fmt.timeZone = TimeZone(secondsFromGMT: 0)
+                    
+                    var nextAir: Date? = nil
+                    if let n = details.nextEpisodeToAir?.airDate, let d = fmt.date(from: n) { nextAir = d }
+                    var lastAir: Date? = nil
+                    if let l = details.lastEpisodeToAir?.airDate, let d = fmt.date(from: l) { lastAir = d }
+                    
+                    let tvmaze = CalendarTvmazeTimes()
+                    let knownIds = CalendarTvmazeTimes.ShowIds(imdb: meta.imdbId, tvdb: nil)
+                    if let tvmazeId = await tvmaze.showId(tmdbId: resolved.id, known: knownIds, externalIds: { _ in nil }) {
+                        let firstDay = CalendarDay(date: now.addingTimeInterval(-14 * 86400), timeZone: .current)
+                        let lastDay = CalendarDay(date: now.addingTimeInterval(14 * 86400), timeZone: .current)
+                        let airings = await tvmaze.airings(tvmazeId: tvmazeId, first: firstDay, last: lastDay)
+                        
+                        if let next = details.nextEpisodeToAir {
+                            if let match = airings.first(where: { $0.season == next.seasonNumber && $0.number == next.episodeNumber }), let at = match.at {
+                                nextAir = at
+                            }
+                        }
+                        if let last = details.lastEpisodeToAir {
+                            if let match = airings.first(where: { $0.season == last.seasonNumber && $0.number == last.episodeNumber }), let at = match.at {
+                                lastAir = at
+                            }
+                        }
+                    }
+                    
+                    guard let picked = pick(next: details.nextEpisodeToAir, nextAir: nextAir, last: details.lastEpisodeToAir, lastAir: lastAir, now: now) else {
+                        return (meta.id, nil)
+                    }
+                    
+                    let season = picked.episode.seasonNumber ?? 0
+                    let episode = picked.episode.episodeNumber ?? 0
+                    let epCode = "S\(season)E\(episode)"
+                    
+                    var epTitle = (picked.episode.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let lower = epTitle.lowercased()
+                    if lower.isEmpty || lower == "tba" || lower.hasPrefix("episode \(episode)") {
+                        epTitle = "Episode \(episode)"
+                    }
+                    
+                    let badgeStr = badge(air: picked.air, isOut: picked.isOut, now: now)
+                    
+                    let label = AiringWeekLabel(
+                        episodeCode: epCode,
+                        episodeTitle: epTitle,
+                        badge: badgeStr,
+                        isOut: picked.isOut,
+                        airDate: picked.air
+                    )
+                    
+                    await cache.set(resolved.id, label: label, expiresAt: expiresAt)
+                    return (meta.id, label)
+                }
+            }
+            
+            for await result in group {
+                if let label = result.1 {
+                    results[result.0] = label
+                }
+            }
+            
+            return results
+        }
+    }
+    
+    /// Pure, unit-testable: which episode to show.
+    /// Rule: if `last` aired within the past 36 hours of `now`, show it (isOut = true).
+    /// Otherwise show `next` if it exists. Otherwise nil.
+    static func pick(next: CalendarTmdb.Episode?, nextAir: Date?, last: CalendarTmdb.Episode?, lastAir: Date?, now: Date) -> (episode: CalendarTmdb.Episode, air: Date, isOut: Bool)? {
+        if let last = last, let lastAir = lastAir {
+            let elapsed = now.timeIntervalSince(lastAir)
+            if elapsed >= 0 && elapsed <= 36 * 3600 {
+                return (last, lastAir, true)
+            }
+        }
+        if let next = next, let nextAir = nextAir {
+            return (next, nextAir, now >= nextAir)
+        }
+        return nil
+    }
+    
+    /// Pure: badge text. isOut -> "OUT NOW". Same local day -> "TODAY". Next local day -> "TOMORROW". Else "EEE d MMM" uppercased ("FRI 20 NOV").
+    static func badge(air: Date, isOut: Bool, now: Date, calendar: Calendar = .current) -> String {
+        if isOut { return "OUT NOW" }
+        if calendar.isDate(air, inSameDayAs: now) { return "TODAY" }
+        if calendar.isDate(air, inSameDayAs: calendar.date(byAdding: .day, value: 1, to: now) ?? now) { return "TOMORROW" }
+        
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "EEE d MMM"
+        fmt.timeZone = calendar.timeZone
+        return fmt.string(from: air).uppercased()
+    }
+}
