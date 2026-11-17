@@ -6,9 +6,9 @@ import Foundation
 /// selection and sync choice. Credentials come from the gitignored
 /// `BakedJellyfinSecrets.generated.swift`.
 ///
-/// Also removes rows an earlier build seeded: AioFin on the retired Dubai host
-/// and Aiometa JF, whose 18-library auto-sync never finished and restarted on
-/// every launch.
+/// Also removes rows an earlier build seeded: AioFin on the retired Hetzner
+/// host, the pre-Hetzner Dubai id, and Aiometa JF, whose 18-library auto-sync
+/// never finished and restarted on every launch.
 enum BakedJellyfinAccounts {
     private struct Account {
         let id: String
@@ -18,12 +18,16 @@ enum BakedJellyfinAccounts {
         let password: String
     }
 
-    private static let retiredServerIDs: Set<String> = ["baked-aiofin", "baked-aiometa"]
+    private static let retiredServerIDs: Set<String> = [
+        "baked-aiofin",
+        "baked-aiofin-hetzner",
+        "baked-aiometa",
+    ]
 
     private static var accounts: [Account] {
         [
             Account(
-                id: "baked-aiofin-hetzner",
+                id: "baked-aiofin-dubai",
                 displayName: "AioFin",
                 url: BakedJellyfinSecrets.aiofinURL,
                 username: BakedJellyfinSecrets.aiofinUsername,
