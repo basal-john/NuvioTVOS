@@ -20,11 +20,15 @@ final class StreamsRepository: ObservableObject {
     /// finish as failed without blocking the rest or smart autoplay forever.
     nonisolated static let streamRequestTimeout: TimeInterval = 15
 
+    /// Shared URLSession used for Jellyfin `PlaybackInfo` requests; overridable in tests.
+    nonisolated(unsafe) static var jellyfinSession: URLSession = .shared
+
     @Published private(set) var state = StreamsDiscoveryState()
 
     private var activeJob: Task<Void, Never>?
     private var activeRequestKey: String?
     private var activeAddonManifestURLs: [URL]?
+    private var activeJellyfinTargetKeys: [String]?
 
     /// Actor-backed success-only cache (no permanent failure entries).
     private static let manifestCache = StreamManifestCache()
@@ -46,9 +50,13 @@ final class StreamsRepository: ObservableObject {
         activeRequestKey: String?,
         requestKey: String,
         activeAddonManifestURLs: [URL]?,
-        configuredAddonManifestURLs: [URL]
+        configuredAddonManifestURLs: [URL],
+        activeJellyfinTargetKeys: [String]? = nil,
+        jellyfinTargetKeys: [String]? = nil
     ) -> Bool {
-        activeRequestKey == requestKey && activeAddonManifestURLs == configuredAddonManifestURLs
+        activeRequestKey == requestKey
+            && activeAddonManifestURLs == configuredAddonManifestURLs
+            && (jellyfinTargetKeys == nil || activeJellyfinTargetKeys == jellyfinTargetKeys)
     }
 
     /// Parse `tt1234567:1:5`-style series episode ids into season/episode.
@@ -203,6 +211,47 @@ final class StreamsRepository: ObservableObject {
         )
     }
 
+    /// Resolves configured Jellyfin servers that hold a synced item for `videoId`
+    /// so playback works without needing any Stremio stream add-on manifest.
+    private func jellyfinTargets(
+        for videoId: String,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> [JellyfinStreamTarget] {
+        let contentId = Self.baseContentId(from: videoId)
+        let resolvedEpisode = (season == nil && episode == nil)
+            ? Self.seasonEpisode(fromVideoId: videoId)
+            : (season, episode)
+        let matchingTitles = JellyfinLibraryIndex.shared.titles(matching: contentId)
+        guard !matchingTitles.isEmpty else { return [] }
+
+        let servers = Dictionary(uniqueKeysWithValues: JellyfinServerStore.shared.servers.map { ($0.id, $0) })
+        var offeredServerIDs = Set<String>()
+        var targets: [JellyfinStreamTarget] = []
+
+        for title in matchingTitles {
+            guard let server = servers[title.serverID],
+                  let baseURL = server.baseURL,
+                  !offeredServerIDs.contains(server.id) else { continue }
+            guard let item = title.items.first(where: { $0.season == resolvedEpisode.0 && $0.episode == resolvedEpisode.1 }) else {
+                continue
+            }
+            offeredServerIDs.insert(server.id)
+            targets.append(
+                JellyfinStreamTarget(
+                    addonId: "jellyfin.\(server.id)",
+                    displayName: server.displayName,
+                    serverId: server.id,
+                    baseURL: baseURL,
+                    userId: server.userId,
+                    accessToken: JellyfinCredentialStore.token(forServerID: server.id),
+                    item: item
+                )
+            )
+        }
+        return targets
+    }
+
     // MARK: - Public API
 
     func load(
@@ -217,6 +266,8 @@ final class StreamsRepository: ObservableObject {
             : (season, episode)
         let key = Self.requestKey(type: type, videoId: videoId, season: se.0, episode: se.1)
         let addonManifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
+        let currentJellyfinTargets = jellyfinTargets(for: videoId, season: se.0, episode: se.1)
+        let currentJellyfinTargetKeys = currentJellyfinTargets.map(\.cacheKey)
         let current = state
 
         if !forceRefresh,
@@ -224,7 +275,9 @@ final class StreamsRepository: ObservableObject {
             activeRequestKey: activeRequestKey,
             requestKey: key,
             activeAddonManifestURLs: activeAddonManifestURLs,
-            configuredAddonManifestURLs: addonManifestURLs),
+            configuredAddonManifestURLs: addonManifestURLs,
+            activeJellyfinTargetKeys: activeJellyfinTargetKeys,
+            jellyfinTargetKeys: currentJellyfinTargetKeys),
            current.hasResolvedTargets || current.isAnyLoading || current.emptyStateReason != nil {
             print("[StreamsRepo] skip reload key=\(key) groups=\(current.groups.count) loading=\(current.isAnyLoading)")
             return
@@ -232,6 +285,7 @@ final class StreamsRepository: ObservableObject {
 
         activeRequestKey = key
         activeAddonManifestURLs = addonManifestURLs
+        activeJellyfinTargetKeys = currentJellyfinTargetKeys
         state = StreamsDiscoveryState(
             requestKey: key,
             revision: state.revision &+ 1,
@@ -245,7 +299,8 @@ final class StreamsRepository: ObservableObject {
                 requestKey: key,
                 type: type,
                 videoId: videoId,
-                addonManifestURLs: addonManifestURLs
+                addonManifestURLs: addonManifestURLs,
+                jellyfinTargets: currentJellyfinTargets
             )
         }
     }
@@ -362,7 +417,7 @@ final class StreamsRepository: ObservableObject {
     // MARK: - Discovery
 
     private func runDiscovery(requestKey: String, type: String, videoId: String,
-                              addonManifestURLs: [URL]) async {
+                              addonManifestURLs: [URL], jellyfinTargets: [JellyfinStreamTarget]) async {
         guard !Task.isCancelled else { return }
         let plexTracks = await plexTracks(videoId: videoId)
         guard !Task.isCancelled else { return }
@@ -384,7 +439,7 @@ final class StreamsRepository: ObservableObject {
         guard !Task.isCancelled else { return }
         let pluginTargets = PluginStreamDiscovery.targets(type: type, videoID: pluginVideoId)
 
-        guard !enabledURLs.isEmpty || !pluginTargets.isEmpty || startingAIO else {
+        guard !enabledURLs.isEmpty || !pluginTargets.isEmpty || !jellyfinTargets.isEmpty || startingAIO else {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
                 revision: state.revision &+ 1,
@@ -442,7 +497,7 @@ final class StreamsRepository: ObservableObject {
             )
         }
 
-        guard !targets.isEmpty || !pluginTargets.isEmpty || startingAIO else {
+        guard !targets.isEmpty || !pluginTargets.isEmpty || !jellyfinTargets.isEmpty || startingAIO else {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
                 revision: state.revision &+ 1,
@@ -455,7 +510,15 @@ final class StreamsRepository: ObservableObject {
         }
 
         // Create every group as loading *before* any request so chips appear immediately.
-        let initialGroups = ownedGroups + targets.map {
+        let initialGroups = ownedGroups + jellyfinTargets.map {
+            AddonStreamGroup(
+                addonId: $0.addonId,
+                displayName: $0.displayName,
+                streams: [],
+                isLoading: true,
+                error: nil
+            )
+        } + targets.map {
             AddonStreamGroup(
                 addonId: $0.addonId,
                 displayName: $0.displayName,
@@ -477,7 +540,13 @@ final class StreamsRepository: ObservableObject {
             hasResolvedTargets: true
         )
 
+        let jellyfinSession = Self.jellyfinSession
         await withTaskGroup(of: GroupUpdate.self) { group in
+            for target in jellyfinTargets {
+                group.addTask {
+                    await Self.fetchJellyfinGroup(target: target, session: jellyfinSession)
+                }
+            }
             for target in targets {
                 group.addTask { [weak self] in
                     await Self.fetchAddonGroup(target: target, type: type, videoId: videoId) { [weak self] partial in
@@ -634,6 +703,211 @@ final class StreamsRepository: ObservableObject {
     private struct GroupUpdate {
         let addonId: String
         let group: AddonStreamGroup
+    }
+
+    struct JellyfinStreamTarget: Sendable {
+        let addonId: String
+        let displayName: String
+        let serverId: String
+        let baseURL: URL
+        let userId: String
+        let accessToken: String
+        let item: JellyfinIndexedItem
+
+        var cacheKey: String {
+            "\(serverId)::\(item.itemId)::\(baseURL.absoluteString)::\(userId)"
+        }
+    }
+
+    nonisolated private static func formattedJellyfinSize(_ bytes: Int64?) -> String? {
+        guard let bytes, bytes > 0 else { return nil }
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useGB, .useMB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    /// Queries `POST /Items/{itemId}/PlaybackInfo` so multi-source servers like
+    /// AioFin return every ranked source, falling back to the static stream URL
+    /// when a server returns 404/405/501 for `PlaybackInfo`.
+    nonisolated private static func fetchJellyfinGroup(
+        target: JellyfinStreamTarget,
+        session: URLSession = .shared
+    ) async -> GroupUpdate {
+        let client = JellyfinClient(
+            baseURL: target.baseURL,
+            accessToken: target.accessToken,
+            session: session
+        )
+        do {
+            let mediaSources = try await client.playbackInfo(
+                itemId: target.item.itemId,
+                userId: target.userId.isEmpty ? nil : target.userId
+            )
+            let streams = jellyfinStreams(from: mediaSources, target: target)
+            let presented = await DebridStreamPresentation.present(streams: streams)
+            return GroupUpdate(
+                addonId: target.addonId,
+                group: AddonStreamGroup(
+                    addonId: target.addonId,
+                    displayName: target.displayName,
+                    streams: presented,
+                    isLoading: false,
+                    error: nil
+                )
+            )
+        } catch is CancellationError {
+            return GroupUpdate(
+                addonId: target.addonId,
+                group: AddonStreamGroup(
+                    addonId: target.addonId,
+                    displayName: target.displayName,
+                    streams: [],
+                    isLoading: false,
+                    error: nil
+                )
+            )
+        } catch let error as JellyfinClient.ClientError
+                    where error.statusCode.map({ [404, 405, 501].contains($0) }) == true {
+            let fallback = fallbackJellyfinStream(for: target).map { [$0] } ?? []
+            let presented = await DebridStreamPresentation.present(streams: fallback)
+            return GroupUpdate(
+                addonId: target.addonId,
+                group: AddonStreamGroup(
+                    addonId: target.addonId,
+                    displayName: target.displayName,
+                    streams: presented,
+                    isLoading: false,
+                    error: nil
+                )
+            )
+        } catch {
+            if (error as? URLError)?.code == .cancelled {
+                return GroupUpdate(
+                    addonId: target.addonId,
+                    group: AddonStreamGroup(
+                        addonId: target.addonId,
+                        displayName: target.displayName,
+                        streams: [],
+                        isLoading: false,
+                        error: nil
+                    )
+                )
+            }
+            let message = (error as? URLError)?.code == .timedOut
+                ? "Timed out"
+                : error.localizedDescription
+            print("[StreamsRepo] jellyfin failed server=\(target.serverId) error=\(message)")
+            return GroupUpdate(
+                addonId: target.addonId,
+                group: AddonStreamGroup(
+                    addonId: target.addonId,
+                    displayName: target.displayName,
+                    streams: [],
+                    isLoading: false,
+                    error: message
+                )
+            )
+        }
+    }
+
+    nonisolated static func jellyfinStreams(
+        from sources: [JellyfinPlaybackMediaSource],
+        target: JellyfinStreamTarget
+    ) -> [NuvioStream] {
+        sources.compactMap { source -> NuvioStream? in
+            let streamURLString: String?
+            if let sourceId = cleanedJellyfinText(source.id) {
+                streamURLString = target.item.streamURL(
+                    baseURL: target.baseURL,
+                    accessToken: target.accessToken,
+                    mediaSourceId: sourceId,
+                    container: source.container
+                )?.absoluteString
+            } else if source.sourceProtocol?.caseInsensitiveCompare("http") == .orderedSame,
+                      let path = cleanedJellyfinText(source.path),
+                      path.lowercased().hasPrefix("http://") || path.lowercased().hasPrefix("https://") {
+                streamURLString = path
+            } else {
+                streamURLString = target.item.streamURL(
+                    baseURL: target.baseURL,
+                    accessToken: target.accessToken,
+                    mediaSourceId: nil,
+                    container: source.container
+                )?.absoluteString
+            }
+            guard let url = streamURLString, !url.isEmpty else { return nil }
+
+            let resolvedSize = source.size ?? source.aiostreams?.size ?? target.item.size
+            let splitName = splitJellyfinSourceName(source.name)
+            let name = cleanedJellyfinText(source.aiostreams?.name)
+                ?? splitName?.title
+                ?? cleanedJellyfinText(source.name)
+                ?? target.displayName
+            let description = cleanedJellyfinText(source.aiostreams?.description)
+                ?? splitName?.detail
+                ?? formattedJellyfinSize(resolvedSize)
+
+            let subtitles: [NuvioSubtitle] = (source.mediaStreams ?? []).compactMap { mediaStream in
+                guard mediaStream.type?.caseInsensitiveCompare("Subtitle") == .orderedSame,
+                      mediaStream.isExternal == true,
+                      let deliveryUrl = mediaStream.deliveryUrl,
+                      let resolvedURL = JellyfinClient.subtitleURL(
+                        baseURL: target.baseURL,
+                        deliveryPath: deliveryUrl,
+                        isExternalURL: mediaStream.isExternalUrl == true
+                      ) else {
+                    return nil
+                }
+                return NuvioSubtitle(
+                    url: resolvedURL.absoluteString,
+                    language: cleanedJellyfinText(mediaStream.language) ?? "und",
+                    label: cleanedJellyfinText(mediaStream.displayTitle) ?? cleanedJellyfinText(mediaStream.title),
+                    source: target.displayName
+                )
+            }
+
+            return NuvioStream(
+                url: url,
+                name: name,
+                description: description,
+                addonName: target.displayName,
+                subtitles: subtitles,
+                filename: cleanedJellyfinText(source.aiostreams?.filename),
+                videoSize: resolvedSize,
+                bingeGroup: cleanedJellyfinText(source.aiostreams?.bingeGroup),
+                isCached: source.aiostreams?.cached,
+                httpHeaders: source.requiredHttpHeaders
+            )
+        }
+    }
+
+    nonisolated private static func fallbackJellyfinStream(for target: JellyfinStreamTarget) -> NuvioStream? {
+        guard let url = target.item.streamURL(baseURL: target.baseURL, accessToken: target.accessToken) else {
+            return nil
+        }
+        let sizeLabel = formattedJellyfinSize(target.item.size)
+        return NuvioStream(
+            url: url.absoluteString,
+            name: target.displayName,
+            description: sizeLabel,
+            addonName: target.displayName,
+            videoSize: target.item.size
+        )
+    }
+
+    nonisolated private static func cleanedJellyfinText(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    nonisolated private static func splitJellyfinSourceName(_ raw: String?) -> (title: String, detail: String?)? {
+        guard let cleaned = cleanedJellyfinText(raw) else { return nil }
+        let parts = cleaned.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let first = cleanedJellyfinText(String(parts[0])) else { return nil }
+        let rest = parts.count > 1 ? cleanedJellyfinText(String(parts[1])) : nil
+        return (first, rest)
     }
 
     // The AIOStreams addon while AIOStreams starts.

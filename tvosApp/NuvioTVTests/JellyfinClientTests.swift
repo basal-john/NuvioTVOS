@@ -638,4 +638,125 @@ final class JellyfinClientTests: XCTestCase {
         XCTAssertEqual(episodes[1].id, "ep-2")
         XCTAssertEqual(episodes[1].seriesId, "series-abc")
     }
+
+    func testPlaybackInfoSendsPostAndDecodesAiostreamsAndSubtitles() async throws {
+        var capturedRequest: URLRequest?
+        let prefixedBaseURL = URL(string: "https://jf.example.com/jellyfin")!
+
+        JellyfinMockURLProtocol.requestHandler = { request in
+            capturedRequest = request
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let json = """
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms-4k-1",
+                        "Name": "Fallback Name",
+                        "Container": "mkv",
+                        "Size": 21474836480,
+                        "Protocol": "Http",
+                        "Path": "https://jf.example.com/api/v1/debrid/playback/token-1",
+                        "SupportsDirectPlay": true,
+                        "RequiredHttpHeaders": { "X-Proxy": "1" },
+                        "MediaStreams": [
+                            {
+                                "Type": "Video",
+                                "DisplayTitle": "4K HEVC"
+                            },
+                            {
+                                "Type": "Subtitle",
+                                "Language": "eng",
+                                "Title": "English",
+                                "DisplayTitle": "English (SDH)",
+                                "IsExternal": true,
+                                "IsExternalUrl": false,
+                                "DeliveryUrl": "/Videos/item-9/ms-4k-1/Subtitles/0/0/Stream.vtt?ApiKey=tok"
+                            }
+                        ],
+                        "aiostreams": {
+                            "name": "TB 4K HDR",
+                            "description": "Movie.2026.2160p.mkv",
+                            "filename": "Movie.2026.2160p.mkv",
+                            "bingeGroup": "aio-4k-hdr",
+                            "cached": true,
+                            "size": 21474836480
+                        }
+                    }
+                ]
+            }
+            """
+            return (response, Data(json.utf8))
+        }
+
+        let client = JellyfinClient(baseURL: prefixedBaseURL, accessToken: "tok", session: session)
+        let sources = try await client.playbackInfo(itemId: "item-9", userId: "user-42")
+
+        let req = try XCTUnwrap(capturedRequest)
+        XCTAssertEqual(req.httpMethod, "POST")
+        XCTAssertEqual(req.url?.path, "/jellyfin/Items/item-9/PlaybackInfo")
+        let queryItems = URLComponents(url: try XCTUnwrap(req.url), resolvingAgainstBaseURL: false)?.queryItems
+        XCTAssertEqual(queryItems?.first(where: { $0.name == "UserId" })?.value, "user-42")
+        let authHeader = try XCTUnwrap(req.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertTrue(authHeader.contains("Token=\"tok\""))
+
+        XCTAssertEqual(sources.count, 1)
+        XCTAssertEqual(sources[0].id, "ms-4k-1")
+        XCTAssertEqual(sources[0].aiostreams?.name, "TB 4K HDR")
+        XCTAssertEqual(sources[0].aiostreams?.cached, true)
+        XCTAssertEqual(sources[0].requiredHttpHeaders, ["X-Proxy": "1"])
+
+        let resolvedSub = JellyfinClient.subtitleURL(
+            baseURL: prefixedBaseURL,
+            deliveryPath: try XCTUnwrap(sources[0].mediaStreams?.last?.deliveryUrl),
+            isExternalURL: false
+        )
+        XCTAssertEqual(
+            resolvedSub?.absoluteString,
+            "https://jf.example.com/jellyfin/Videos/item-9/ms-4k-1/Subtitles/0/0/Stream.vtt?ApiKey=tok"
+        )
+    }
+
+    func testPlaybackInfoCapturesHTTPStatusCodeOnError() async {
+        JellyfinMockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!
+            return (response, Data())
+        }
+
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "tok", session: session)
+        do {
+            _ = try await client.playbackInfo(itemId: "missing", userId: "user-1")
+            XCTFail("Expected ClientError")
+        } catch let error as JellyfinClient.ClientError {
+            XCTAssertEqual(error.statusCode, 404)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testIndexedItemStreamURLIncludesMediaSourceIdAndOverridesContainer() throws {
+        let prefixedBaseURL = URL(string: "https://jf.example.com/jellyfin")!
+        let item = JellyfinIndexedItem(
+            itemId: "item-55",
+            container: "mp4",
+            size: 1_000,
+            season: nil,
+            episode: nil,
+            episodeName: nil,
+            episodeOverview: nil,
+            episodePremiereDate: nil,
+            episodeImageTag: nil
+        )
+
+        let baseStreamURL = try XCTUnwrap(item.streamURL(baseURL: prefixedBaseURL, accessToken: "tok"))
+        let baseQuery = URLComponents(url: baseStreamURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertNil(baseQuery.first(where: { $0.name == "MediaSourceId" }))
+        XCTAssertEqual(baseQuery.first(where: { $0.name == "container" })?.value, "mp4")
+
+        let sourceStreamURL = try XCTUnwrap(
+            item.streamURL(baseURL: prefixedBaseURL, accessToken: "tok", mediaSourceId: "ms-2", container: "mkv")
+        )
+        let sourceQuery = URLComponents(url: sourceStreamURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(sourceQuery.first(where: { $0.name == "MediaSourceId" })?.value, "ms-2")
+        XCTAssertEqual(sourceQuery.first(where: { $0.name == "container" })?.value, "mkv")
+    }
 }

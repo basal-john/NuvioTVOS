@@ -4,7 +4,7 @@ import Foundation
 /// only item; for a series it's one episode. The `episode*` fields are the
 /// per-episode display data `meta(forContentId:)` turns into `NuvioVideo`
 /// entries — nil for a movie's single item.
-struct JellyfinIndexedItem: Codable, Equatable {
+struct JellyfinIndexedItem: Codable, Equatable, Sendable {
     let itemId: String
     let container: String?
     let size: Int64?
@@ -18,10 +18,20 @@ struct JellyfinIndexedItem: Codable, Equatable {
     /// `{baseURL}/Videos/{itemId}/stream?static=true&api_key=...` — what
     /// playback opens directly, no `AetherEngine` transport needed since
     /// Jellyfin already serves plain HTTP(S).
-    func streamURL(baseURL: URL, accessToken: String) -> URL? {
+    func streamURL(
+        baseURL: URL,
+        accessToken: String,
+        mediaSourceId: String? = nil,
+        container: String? = nil
+    ) -> URL? {
         var components = URLComponents(url: baseURL.appendingPathComponent("Videos/\(itemId)/stream"), resolvingAgainstBaseURL: false)
         var query = [URLQueryItem(name: "static", value: "true"), URLQueryItem(name: "api_key", value: accessToken)]
-        if let container { query.append(URLQueryItem(name: "container", value: container)) }
+        if let mediaSourceId, !mediaSourceId.isEmpty {
+            query.append(URLQueryItem(name: "MediaSourceId", value: mediaSourceId))
+        }
+        if let resolvedContainer = container ?? self.container, !resolvedContainer.isEmpty {
+            query.append(URLQueryItem(name: "container", value: resolvedContainer))
+        }
         components?.queryItems = query
         return components?.url
     }

@@ -51,11 +51,71 @@ struct JellyfinItemsPage {
     let totalRecordCount: Int?
 }
 
+/// One subtitle or stream track attached to a Jellyfin `PlaybackInfo` media source.
+struct JellyfinPlaybackMediaStream: Decodable, Equatable, Sendable {
+    let type: String?
+    let language: String?
+    let title: String?
+    let displayTitle: String?
+    let isExternal: Bool?
+    let isExternalUrl: Bool?
+    let deliveryUrl: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type = "Type"
+        case language = "Language"
+        case title = "Title"
+        case displayTitle = "DisplayTitle"
+        case isExternal = "IsExternal"
+        case isExternalUrl = "IsExternalUrl"
+        case deliveryUrl = "DeliveryUrl"
+    }
+}
+
+/// Optional AIOStreams metadata embedded on a Jellyfin `MediaSource` by AioFin.
+struct JellyfinPlaybackAiostreamsMeta: Decodable, Equatable, Sendable {
+    let name: String?
+    let description: String?
+    let filename: String?
+    let bingeGroup: String?
+    let cached: Bool?
+    let size: Int64?
+}
+
+/// One playable media source returned by `POST /Items/{itemId}/PlaybackInfo`.
+struct JellyfinPlaybackMediaSource: Decodable, Equatable, Sendable {
+    let id: String?
+    let name: String?
+    let container: String?
+    let size: Int64?
+    let path: String?
+    let sourceProtocol: String?
+    let supportsDirectPlay: Bool?
+    let supportsDirectStream: Bool?
+    let requiredHttpHeaders: [String: String]?
+    let mediaStreams: [JellyfinPlaybackMediaStream]?
+    let aiostreams: JellyfinPlaybackAiostreamsMeta?
+
+    enum CodingKeys: String, CodingKey {
+        case id = "Id"
+        case name = "Name"
+        case container = "Container"
+        case size = "Size"
+        case path = "Path"
+        case sourceProtocol = "Protocol"
+        case supportsDirectPlay = "SupportsDirectPlay"
+        case supportsDirectStream = "SupportsDirectStream"
+        case requiredHttpHeaders = "RequiredHttpHeaders"
+        case mediaStreams = "MediaStreams"
+        case aiostreams
+    }
+}
+
 /// Thin REST client for one Jellyfin server. Stateless beyond the
 /// credentials it's constructed with; `JellyfinSessionManager` owns the
 /// actual per-server connection lifecycle. See the [Jellyfin API
 /// docs](https://api.jellyfin.org) for the endpoints used here.
-struct JellyfinClient {
+struct JellyfinClient: Sendable {
     let baseURL: URL
     let accessToken: String
     private let session: URLSession
@@ -76,7 +136,13 @@ struct JellyfinClient {
 
     struct ClientError: LocalizedError {
         let message: String
+        let statusCode: Int?
         var errorDescription: String? { message }
+
+        init(message: String, statusCode: Int? = nil) {
+            self.message = message
+            self.statusCode = statusCode
+        }
     }
 
     // MARK: - Headers
@@ -471,6 +537,36 @@ struct JellyfinClient {
         throw ClientError(message: "The server episode list exceeded the 500-page sync limit")
     }
 
+    /// Fetches playable media sources for a movie or episode via `POST /Items/{itemId}/PlaybackInfo`.
+    func playbackInfo(
+        itemId: String,
+        userId: String? = nil,
+        timeout: TimeInterval = 20
+    ) async throws -> [JellyfinPlaybackMediaSource] {
+        var components = URLComponents(url: baseURL.appendingPathComponent("Items/\(itemId)/PlaybackInfo"), resolvingAgainstBaseURL: false)
+        if let userId, !userId.isEmpty {
+            components?.queryItems = [URLQueryItem(name: "UserId", value: userId)]
+        }
+        guard let url = components?.url else {
+            throw ClientError(message: "Invalid request URL")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(Self.authorizationHeader(token: accessToken), forHTTPHeaderField: "Authorization")
+        request.httpBody = Data("{}".utf8)
+
+        let (data, response) = try await send(request)
+        try Self.validate(response, data: data)
+
+        struct Payload: Decodable {
+            let MediaSources: [JellyfinPlaybackMediaSource]?
+        }
+        let payload = try JSONDecoder().decode(Payload.self, from: data)
+        return payload.MediaSources ?? []
+    }
+
     // MARK: - Media URLs
 
     /// `{baseURL}/Items/{itemId}/Images/{type}?tag=...&api_key=...` — the
@@ -484,6 +580,18 @@ struct JellyfinClient {
         return components?.url
     }
 
+    /// Resolves a Jellyfin subtitle `DeliveryUrl` against the server's `baseURL` without losing any path prefix.
+    static func subtitleURL(baseURL: URL, deliveryPath: String, isExternalURL: Bool = false) -> URL? {
+        let trimmed = deliveryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if isExternalURL || trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://") {
+            return URL(string: trimmed)
+        }
+        let base = baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let suffix = trimmed.hasPrefix("/") ? trimmed : "/\(trimmed)"
+        return URL(string: base + suffix)
+    }
+
     // MARK: - Plumbing
 
     private func get(_ path: String, query: [String: String] = [:]) async throws -> (Data, URLResponse) {
@@ -494,12 +602,10 @@ struct JellyfinClient {
         }
         var request = URLRequest(url: url)
         request.setValue(Self.authorizationHeader(token: accessToken), forHTTPHeaderField: "Authorization")
-        // A library sync sends many requests in a row (one or more per series for
-        // episodes). Servers behind a reverse proxy or a hosted plan can answer
-        // 429 Too Many Requests, or 503 while busy. Wait and ask again instead of
-        // failing the whole sync, but never sooner than the server asked, and
-        // never for longer than we're willing to sit silently: then stop and say
-        // when to try again.
+        return try await send(request)
+    }
+
+    private func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
         var attempt = 0
         while true {
             try Task.checkCancellation()
@@ -515,7 +621,6 @@ struct JellyfinClient {
             switch Self.retryDecision(retryAfter: retryAfter, attempt: attempt) {
             case .retry(let delay):
                 attempt += 1
-                // Throws CancellationError at once if the sync is cancelled.
                 try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             case .giveUp(let serverWait):
                 throw RateLimitedError(retryAfter: serverWait)
@@ -611,9 +716,15 @@ struct JellyfinClient {
         }
         guard (200...299).contains(http.statusCode) else {
             if http.statusCode == 401 {
-                throw ClientError(message: L10n.string("jellyfin_error_unauthorized", fallback: "Invalid API key or credentials"))
+                throw ClientError(
+                    message: L10n.string("jellyfin_error_unauthorized", fallback: "Invalid API key or credentials"),
+                    statusCode: http.statusCode
+                )
             }
-            throw ClientError(message: L10n.format("jellyfin_error_status", fallback: "Server returned status %d", http.statusCode))
+            throw ClientError(
+                message: L10n.format("jellyfin_error_status", fallback: "Server returned status %d", http.statusCode),
+                statusCode: http.statusCode
+            )
         }
     }
 }

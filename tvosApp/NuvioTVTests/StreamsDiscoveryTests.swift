@@ -1911,6 +1911,392 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertEqual(firstTitleByID["shared-item"]?.name, "First title")
     }
 
+    @MainActor
+    func testJellyfinPlaybackInfoResolvesStreamsWithoutAddonManifests() async throws {
+        let previousCredentialStorage = JellyfinCredentialStore.storage
+        JellyfinCredentialStore.storage = MemoryJellyfinCredentialStorage()
+        let previousJellyfinSession = StreamsRepository.jellyfinSession
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockStreamHTTPURLProtocol.self]
+        StreamsRepository.jellyfinSession = URLSession(configuration: configuration)
+        let previousProfileID = ProfileSettings.activeProfileID
+        let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        ProfileSettings.setActiveProfile("jellyfin-play-\(UUID().uuidString)", isPrimary: false)
+
+        let serverID = "srv-\(UUID().uuidString)"
+        defer {
+            StreamsRepository.jellyfinSession = previousJellyfinSession
+            MockStreamHTTPURLProtocol.handler = nil
+            JellyfinLibraryIndex.shared.removeAll(forServerID: serverID)
+            JellyfinServerStore.shared.remove(serverID)
+            CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([])
+            if let previousProfileID {
+                ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousProfileIsPrimary)
+            } else {
+                ProfileSettings.clearActiveProfile()
+            }
+            JellyfinCredentialStore.storage = previousCredentialStorage
+        }
+
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([])
+        JellyfinServerStore.shared.upsert(JellyfinServerConfig(
+            id: serverID,
+            displayName: "AioFin",
+            baseURLString: "https://jf.example.com/jellyfin",
+            userId: "user-1",
+            syncAutomatically: false
+        ))
+        JellyfinCredentialStore.save("secret-token", forServerID: serverID)
+
+        let title = JellyfinIndexedTitle(
+            contentId: JellyfinLibraryIndex.contentId(serverID: serverID, itemId: "movie-item-1"),
+            serverID: serverID,
+            libraryID: "lib-trending",
+            libraryName: "Trending",
+            itemId: "movie-item-1",
+            type: "movie",
+            name: "The Odyssey",
+            overview: nil,
+            year: 2026,
+            genres: nil,
+            communityRating: nil,
+            officialRating: nil,
+            premiereDate: nil,
+            runTimeTicks: nil,
+            imdbId: "tt1234567",
+            tmdbId: nil,
+            primaryImageTag: nil,
+            backdropImageTag: nil,
+            cast: nil,
+            directors: nil,
+            items: [
+                JellyfinIndexedItem(
+                    itemId: "movie-item-1",
+                    container: "mkv",
+                    size: nil,
+                    season: nil,
+                    episode: nil,
+                    episodeName: nil,
+                    episodeOverview: nil,
+                    episodePremiereDate: nil,
+                    episodeImageTag: nil
+                )
+            ]
+        )
+        try JellyfinLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
+
+        var playbackInfoRequests = 0
+        MockStreamHTTPURLProtocol.handler = { request in
+            playbackInfoRequests += 1
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/jellyfin/Items/movie-item-1/PlaybackInfo")
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let json = """
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms-1",
+                        "Name": "Fallback 4K",
+                        "Container": "mkv",
+                        "Size": 18000000000,
+                        "Protocol": "Http",
+                        "MediaStreams": [
+                            {
+                                "Type": "Subtitle",
+                                "Language": "eng",
+                                "DisplayTitle": "English",
+                                "IsExternal": true,
+                                "IsExternalUrl": false,
+                                "DeliveryUrl": "/Videos/movie-item-1/ms-1/Subtitles/0/0/Stream.vtt?ApiKey=secret-token"
+                            }
+                        ],
+                        "aiostreams": {
+                            "name": "TB 4K DV",
+                            "description": "Odyssey.2160p.mkv",
+                            "filename": "Odyssey.2160p.mkv",
+                            "bingeGroup": "group-4k",
+                            "cached": true,
+                            "size": 18000000000
+                        }
+                    },
+                    {
+                        "Id": "ms-2",
+                        "Name": "TB 1080p\\nOdyssey.1080p.mp4",
+                        "Container": "mp4",
+                        "Size": 6000000000,
+                        "Protocol": "Http"
+                    }
+                ]
+            }
+            """
+            return (response, Data(json.utf8))
+        }
+
+        let streams = await StreamsRepository.shared.collectStreams(
+            type: "movie",
+            videoId: "tt1234567",
+            forceRefresh: true
+        )
+
+        XCTAssertEqual(playbackInfoRequests, 1)
+        XCTAssertNil(StreamsRepository.shared.state.emptyStateReason)
+        XCTAssertEqual(StreamsRepository.shared.state.groups.count, 1)
+        XCTAssertEqual(StreamsRepository.shared.state.groups.first?.addonId, "jellyfin.\(serverID)")
+        XCTAssertEqual(StreamsRepository.shared.state.groups.first?.displayName, "AioFin")
+        XCTAssertEqual(streams.count, 2)
+        XCTAssertNotEqual(streams[0].id, streams[1].id)
+        XCTAssertTrue(streams[0].url?.contains("MediaSourceId=ms-1") == true)
+        XCTAssertEqual(streams[0].name, "TB 4K DV")
+        XCTAssertEqual(streams[0].description, "Odyssey.2160p.mkv")
+        XCTAssertEqual(streams[0].filename, "Odyssey.2160p.mkv")
+        XCTAssertEqual(streams[0].videoSize, 18_000_000_000)
+        XCTAssertEqual(streams[0].bingeGroup, "group-4k")
+        XCTAssertEqual(streams[0].isCached, true)
+        XCTAssertEqual(streams[0].subtitles.first?.url, "https://jf.example.com/jellyfin/Videos/movie-item-1/ms-1/Subtitles/0/0/Stream.vtt?ApiKey=secret-token")
+
+        XCTAssertTrue(streams[1].url?.contains("MediaSourceId=ms-2") == true)
+        XCTAssertEqual(streams[1].name, "TB 1080p")
+        XCTAssertEqual(streams[1].description, "Odyssey.1080p.mp4")
+
+        // Synthetic Jellyfin ID lookup resolves the same item without needing any add-on manifest.
+        let syntheticStreams = await StreamsRepository.shared.collectStreams(
+            type: "movie",
+            videoId: title.contentId,
+            forceRefresh: true
+        )
+        XCTAssertEqual(syntheticStreams.count, 2)
+        XCTAssertEqual(playbackInfoRequests, 2)
+    }
+
+    @MainActor
+    func testJellyfinPlaybackInfoMatchesEpisodeAndDeduplicatesSameServer() async throws {
+        let previousCredentialStorage = JellyfinCredentialStore.storage
+        JellyfinCredentialStore.storage = MemoryJellyfinCredentialStorage()
+        let previousJellyfinSession = StreamsRepository.jellyfinSession
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockStreamHTTPURLProtocol.self]
+        StreamsRepository.jellyfinSession = URLSession(configuration: configuration)
+        let previousProfileID = ProfileSettings.activeProfileID
+        let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        ProfileSettings.setActiveProfile("jellyfin-ep-\(UUID().uuidString)", isPrimary: false)
+
+        let serverID = "srv-\(UUID().uuidString)"
+        defer {
+            StreamsRepository.jellyfinSession = previousJellyfinSession
+            MockStreamHTTPURLProtocol.handler = nil
+            JellyfinLibraryIndex.shared.removeAll(forServerID: serverID)
+            JellyfinServerStore.shared.remove(serverID)
+            CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([])
+            if let previousProfileID {
+                ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousProfileIsPrimary)
+            } else {
+                ProfileSettings.clearActiveProfile()
+            }
+            JellyfinCredentialStore.storage = previousCredentialStorage
+        }
+
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([])
+        JellyfinServerStore.shared.upsert(JellyfinServerConfig(
+            id: serverID,
+            displayName: "AioFin",
+            baseURLString: "https://jf.example.com/jellyfin",
+            userId: "user-1",
+            syncAutomatically: false
+        ))
+        JellyfinCredentialStore.save("secret-token", forServerID: serverID)
+
+        let episodeItem = JellyfinIndexedItem(
+            itemId: "ep-s01e02",
+            container: "mkv",
+            size: 3_000_000_000,
+            season: 1,
+            episode: 2,
+            episodeName: "Episode 2",
+            episodeOverview: nil,
+            episodePremiereDate: nil,
+            episodeImageTag: nil
+        )
+        let titleA = JellyfinIndexedTitle(
+            contentId: "jellyfin-\(serverID)-series-libA",
+            serverID: serverID,
+            libraryID: "lib-a",
+            libraryName: "Trending",
+            itemId: "series-libA",
+            type: "series",
+            name: "Example Show",
+            overview: nil,
+            year: 2025,
+            genres: nil,
+            communityRating: nil,
+            officialRating: nil,
+            premiereDate: nil,
+            runTimeTicks: nil,
+            imdbId: "tt7654321",
+            tmdbId: nil,
+            primaryImageTag: nil,
+            backdropImageTag: nil,
+            cast: nil,
+            directors: nil,
+            items: [episodeItem]
+        )
+        let titleB = JellyfinIndexedTitle(
+            contentId: "jellyfin-\(serverID)-series-libB",
+            serverID: serverID,
+            libraryID: "lib-b",
+            libraryName: "Popular",
+            itemId: "series-libB",
+            type: "series",
+            name: "Example Show",
+            overview: nil,
+            year: 2025,
+            genres: nil,
+            communityRating: nil,
+            officialRating: nil,
+            premiereDate: nil,
+            runTimeTicks: nil,
+            imdbId: "tt7654321",
+            tmdbId: nil,
+            primaryImageTag: nil,
+            backdropImageTag: nil,
+            cast: nil,
+            directors: nil,
+            items: [episodeItem]
+        )
+        try JellyfinLibraryIndex.shared.replace(titles: [titleA, titleB], forServerID: serverID)
+
+        var requestedPaths: [String] = []
+        MockStreamHTTPURLProtocol.handler = { request in
+            requestedPaths.append(request.url?.path ?? "")
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"MediaSources":[{"Id":"ms-ep","Name":"1080p","Container":"mkv"}]}"#.utf8))
+        }
+
+        let streams = await StreamsRepository.shared.collectStreams(
+            type: "series",
+            videoId: "tt7654321:1:2",
+            forceRefresh: true
+        )
+
+        XCTAssertEqual(requestedPaths, ["/jellyfin/Items/ep-s01e02/PlaybackInfo"])
+        XCTAssertEqual(StreamsRepository.shared.state.groups.count, 1)
+        XCTAssertEqual(streams.count, 1)
+        XCTAssertTrue(streams[0].url?.contains("/Videos/ep-s01e02/stream") == true)
+
+        requestedPaths.removeAll()
+        let explicitEpisodeStreams = await StreamsRepository.shared.collectStreams(
+            type: "series",
+            videoId: "tt7654321",
+            season: 1,
+            episode: 2,
+            forceRefresh: true
+        )
+        XCTAssertEqual(requestedPaths, ["/jellyfin/Items/ep-s01e02/PlaybackInfo"])
+        XCTAssertEqual(explicitEpisodeStreams.count, 1)
+        XCTAssertTrue(explicitEpisodeStreams[0].url?.contains("/Videos/ep-s01e02/stream") == true)
+    }
+
+    @MainActor
+    func testJellyfinPlaybackInfoFallsBackOn404AndSurfaces500Error() async throws {
+        let previousCredentialStorage = JellyfinCredentialStore.storage
+        JellyfinCredentialStore.storage = MemoryJellyfinCredentialStorage()
+        let previousJellyfinSession = StreamsRepository.jellyfinSession
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockStreamHTTPURLProtocol.self]
+        StreamsRepository.jellyfinSession = URLSession(configuration: configuration)
+        let previousProfileID = ProfileSettings.activeProfileID
+        let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        ProfileSettings.setActiveProfile("jellyfin-err-\(UUID().uuidString)", isPrimary: false)
+
+        let serverID = "srv-\(UUID().uuidString)"
+        defer {
+            StreamsRepository.jellyfinSession = previousJellyfinSession
+            MockStreamHTTPURLProtocol.handler = nil
+            JellyfinLibraryIndex.shared.removeAll(forServerID: serverID)
+            JellyfinServerStore.shared.remove(serverID)
+            CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([])
+            if let previousProfileID {
+                ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousProfileIsPrimary)
+            } else {
+                ProfileSettings.clearActiveProfile()
+            }
+            JellyfinCredentialStore.storage = previousCredentialStorage
+        }
+
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([])
+        JellyfinServerStore.shared.upsert(JellyfinServerConfig(
+            id: serverID,
+            displayName: "Standard Jellyfin",
+            baseURLString: "http://127.0.0.1:8096",
+            userId: "user-1",
+            syncAutomatically: false
+        ))
+        JellyfinCredentialStore.save("tok", forServerID: serverID)
+
+        let title = JellyfinIndexedTitle(
+            contentId: JellyfinLibraryIndex.contentId(serverID: serverID, itemId: "movie-404"),
+            serverID: serverID,
+            libraryID: "lib1",
+            libraryName: "Movies",
+            itemId: "movie-404",
+            type: "movie",
+            name: "Fallback Movie",
+            overview: nil,
+            year: 2024,
+            genres: nil,
+            communityRating: nil,
+            officialRating: nil,
+            premiereDate: nil,
+            runTimeTicks: nil,
+            imdbId: "tt4040404",
+            tmdbId: nil,
+            primaryImageTag: nil,
+            backdropImageTag: nil,
+            cast: nil,
+            directors: nil,
+            items: [
+                JellyfinIndexedItem(
+                    itemId: "movie-404",
+                    container: "mp4",
+                    size: 4_000_000_000,
+                    season: nil,
+                    episode: nil,
+                    episodeName: nil,
+                    episodeOverview: nil,
+                    episodePremiereDate: nil,
+                    episodeImageTag: nil
+                )
+            ]
+        )
+        try JellyfinLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
+
+        MockStreamHTTPURLProtocol.handler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!
+            return (response, Data())
+        }
+
+        let fallbackStreams = await StreamsRepository.shared.collectStreams(
+            type: "movie",
+            videoId: "tt4040404",
+            forceRefresh: true
+        )
+        XCTAssertEqual(fallbackStreams.count, 1)
+        XCTAssertTrue(fallbackStreams[0].url?.contains("/Videos/movie-404/stream") == true)
+        XCTAssertNil(StreamsRepository.shared.state.groups.first?.error)
+
+        MockStreamHTTPURLProtocol.handler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!
+            return (response, Data())
+        }
+
+        let failedStreams = await StreamsRepository.shared.collectStreams(
+            type: "movie",
+            videoId: "tt4040404",
+            forceRefresh: true
+        )
+        XCTAssertTrue(failedStreams.isEmpty)
+        XCTAssertNotNil(StreamsRepository.shared.state.groups.first?.error)
+        XCTAssertEqual(StreamsRepository.shared.state.emptyStateReason, .noStreamsFound)
+    }
 }
 
 private final class MemoryJellyfinCredentialStorage: JellyfinCredentialStorage {
