@@ -100,46 +100,6 @@ final class StreamsRepository: ObservableObject {
         )
     }
 
-    private func jellyfinStreamGroup(videoId: String) -> AddonStreamGroup? {
-        let contentId = Self.baseContentId(from: videoId)
-        let episode = Self.seasonEpisode(fromVideoId: videoId)
-        let matchingTitles = JellyfinLibraryIndex.shared.titles(matching: contentId)
-        guard !matchingTitles.isEmpty else { return nil }
-
-        let servers = Dictionary(uniqueKeysWithValues: JellyfinServerStore.shared.servers.map { ($0.id, $0) })
-        var streams: [NuvioStream] = []
-        var offeredServerIDs = Set<String>()
-
-        for title in matchingTitles {
-            guard let server = servers[title.serverID],
-                  let baseURL = server.baseURL,
-                  !offeredServerIDs.contains(server.id) else { continue }
-            let token = JellyfinCredentialStore.token(forServerID: server.id)
-            let matchingItems = title.items
-                .filter { $0.season == episode.season && $0.episode == episode.episode }
-            guard let item = matchingItems.first,
-                  let url = item.streamURL(baseURL: baseURL, accessToken: token) else { continue }
-            offeredServerIDs.insert(server.id)
-            let size = item.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) }
-            streams.append(
-                NuvioStream(
-                    url: url.absoluteString,
-                    name: server.displayName,
-                    description: ["Server's top source", size].compactMap { $0 }.joined(separator: " · "),
-                    addonName: "Jellyfin",
-                    videoSize: item.size
-                )
-            )
-        }
-        guard !streams.isEmpty else { return nil }
-        return AddonStreamGroup(
-            addonId: "local.jellyfin",
-            displayName: "Jellyfin",
-            streams: streams,
-            isLoading: false
-        )
-    }
-
     /// Sidecar subtitle files for the items about to be offered, read from the
     /// server with a short limit so a slow server never holds up the list.
     private func plexTracks(videoId: String) async -> [String: PlexOfferedTracks] {
@@ -406,7 +366,7 @@ final class StreamsRepository: ObservableObject {
         guard !Task.isCancelled else { return }
         let plexTracks = await plexTracks(videoId: videoId)
         guard !Task.isCancelled else { return }
-        let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId), plexStreamGroup(videoId: videoId, tracks: plexTracks)]
+        let ownedGroups = [localStreamGroup(videoId: videoId), plexStreamGroup(videoId: videoId, tracks: plexTracks)]
             .compactMap { $0 }
         state = StreamsDiscoveryState(
             requestKey: requestKey,
