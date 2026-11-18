@@ -4462,6 +4462,69 @@ extension CrossfadingBackdrop: Equatable {
     }
 }
 
+/// Resolves full-resolution artwork URLs and device-appropriate decode limits so
+/// 4K Apple TVs display crisp detail backdrops rather than 1080p downsamples.
+enum BackdropArtworkResolver {
+    /// Scales the maximum decode dimension to device RAM so 4K Apple TVs (4 GB+)
+    /// keep native 3840px artwork while lower-memory devices stay within budget.
+    static func maxPixelSize(
+        physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory
+    ) -> CGFloat {
+        let gib = Double(physicalMemoryBytes) / 1_073_741_824.0
+        if gib > 3.5 {
+            return 3840.0
+        } else if gib > 2.5 {
+            return 2560.0
+        }
+        return 1920.0
+    }
+
+    /// Returns candidate artwork URLs ordered from highest resolution to the
+    /// original URL for graceful fallback when an upstream lacks an original.
+    static func candidateURLs(for url: URL) -> [URL] {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let host = components.host?.lowercased() else {
+            return [url]
+        }
+        var parts = components.path
+            .split(separator: "/", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        switch host {
+        case "image.tmdb.org":
+            guard parts.count > 4,
+                  parts[1] == "t",
+                  parts[2] == "p",
+                  parts[3] != "original" else {
+                return [url]
+            }
+            parts[3] = "original"
+        case "images.metahub.space":
+            guard parts.count > 3,
+                  ["small", "medium"].contains(parts[2].lowercased()) else {
+                return [url]
+            }
+            parts[2] = "large"
+        case "assets.fanart.tv":
+            if parts.count > 2, parts[1] == "preview" {
+                parts[1] = "fanart"
+            } else if let previewIndex = parts.lastIndex(of: "preview"), previewIndex > 1 {
+                parts.remove(at: previewIndex)
+            } else {
+                return [url]
+            }
+        default:
+            return [url]
+        }
+
+        components.path = parts.joined(separator: "/")
+        guard let upgraded = components.url, upgraded != url else {
+            return [url]
+        }
+        return [upgraded, url]
+    }
+}
+
 /// Small in-memory cache + loader for backdrop images so revisiting a poster is
 /// instant (no decode flicker) and repeated focus changes don't refetch.
 /// A lock-protected class rather than an actor, so a view can read an image
@@ -4504,7 +4567,9 @@ final class BackdropImageCache: @unchecked Sendable {
         #endif
     }
 
-    private static let maxPixelSize: CGFloat = 1920.0
+    private static var maxPixelSize: CGFloat {
+        BackdropArtworkResolver.maxPixelSize()
+    }
 
     func purge() {
         cache.removeAllObjects()
@@ -4513,7 +4578,12 @@ final class BackdropImageCache: @unchecked Sendable {
 
     /// The decoded image when it is already in memory. Never downloads.
     func cachedImage(for url: URL) -> UIImage? {
-        cache.object(forKey: url.absoluteString as NSString)
+        for candidate in BackdropArtworkResolver.candidateURLs(for: url) {
+            if let hit = cache.object(forKey: candidate.absoluteString as NSString) {
+                return hit
+            }
+        }
+        return cache.object(forKey: url.absoluteString as NSString)
     }
 
     /// `minimumBytes` rejects error pages posing as artwork; small rating
@@ -4523,22 +4593,35 @@ final class BackdropImageCache: @unchecked Sendable {
         priority: TaskPriority = .userInitiated,
         minimumBytes: Int = 512
     ) async -> UIImage? {
-        let key = url.absoluteString
-        if let cached = cache.object(forKey: key as NSString) { return cached }
+        if let cached = cachedImage(for: url) { return cached }
+        let candidates = minimumBytes > 0 ? BackdropArtworkResolver.candidateURLs(for: url) : [url]
+        let key = (candidates.first ?? url).absoluteString
+        let rawKey = url.absoluteString
         let pixelSize = Self.maxPixelSize
         let task: Task<UIImage?, Never> = lock.withLock {
             if let pending = inFlight[key] { return pending }
             let task = Task.detached(priority: priority) { [weak self] () -> UIImage? in
                 var decoded: UIImage?
-                if let (data, response) = try? await URLSession.shared.data(from: url) {
-                    let statusOK = (response as? HTTPURLResponse).map { (200...299).contains($0.statusCode) } ?? true
-                    if statusOK, data.count > minimumBytes {
-                        decoded = downsampleBackdropImage(data: data, maxPixelSize: pixelSize)
+                var resolvedKey: String?
+                for candidate in candidates {
+                    if Task.isCancelled { break }
+                    if let (data, response) = try? await URLSession.shared.data(from: candidate) {
+                        let statusOK = (response as? HTTPURLResponse).map { (200...299).contains($0.statusCode) } ?? true
+                        if statusOK, data.count > minimumBytes,
+                           let image = downsampleBackdropImage(data: data, maxPixelSize: pixelSize) {
+                            decoded = image
+                            resolvedKey = candidate.absoluteString
+                            break
+                        }
                     }
                 }
                 // Store before leaving the in-flight list, so a caller arriving
                 // in between finds the image instead of downloading it again.
-                self?.finishLoad(key: key, image: decoded)
+                self?.finishLoad(
+                    key: key,
+                    aliasKeys: Array(Set([rawKey, resolvedKey].compactMap { $0 })),
+                    image: decoded
+                )
                 return decoded
             }
             inFlight[key] = task
@@ -4547,10 +4630,13 @@ final class BackdropImageCache: @unchecked Sendable {
         return await task.value
     }
 
-    private func finishLoad(key: String, image: UIImage?) {
+    private func finishLoad(key: String, aliasKeys: [String] = [], image: UIImage?) {
         if let image {
             let cost = image.decodedByteCost
-            cache.setObject(image, forKey: key as NSString, cost: cost)
+            let keys = Set([key] + aliasKeys)
+            for k in keys {
+                cache.setObject(image, forKey: k as NSString, cost: cost)
+            }
             Self.tracker.recordInsertion(cost: cost)
         }
         lock.withLock { inFlight[key] = nil }
@@ -5455,6 +5541,7 @@ private final class TVHomeFocusWork {
     var pendingSectionId: String?
     var focusSettleTask: Task<Void, Never>?
     var heroEnrichmentTask: Task<Void, Never>?
+    var streamPrefetchTask: Task<Void, Never>?
     var enrichedHeroMetadata: [String: NuvioMeta] = [:]
     var pendingLandscapeFocusedId: String?
     var landscapeFocusTask: Task<Void, Never>?
@@ -5490,6 +5577,7 @@ private final class TVHomeFocusWork {
         restoreReleaseTask?.cancel()
         focusSettleTask?.cancel()
         heroEnrichmentTask?.cancel()
+        streamPrefetchTask?.cancel()
         landscapeFocusTask?.cancel()
         fastScrollSettleTask?.cancel()
         upwardFocusTask?.cancel()
@@ -5499,6 +5587,7 @@ private final class TVHomeFocusWork {
         restoreReleaseTask = nil
         focusSettleTask = nil
         heroEnrichmentTask = nil
+        streamPrefetchTask = nil
         landscapeFocusTask = nil
         fastScrollSettleTask = nil
         upwardFocusTask = nil
@@ -10105,6 +10194,8 @@ struct TVHomeView: View {
     private func scheduleHeroSettle() {
         focusWork.focusSettleTask?.cancel()
         focusWork.heroEnrichmentTask?.cancel()
+        focusWork.streamPrefetchTask?.cancel()
+        focusWork.streamPrefetchTask = nil
 
         let targetMetaId = focusWork.pendingFocusedMeta?.id
         let targetFolderId = focusWork.pendingFocusedFolder?.id
@@ -10167,11 +10258,73 @@ struct TVHomeView: View {
                     + "elapsedMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
             )
 
+            triggerHomeDwellStreamPrefetch(
+                for: settledMeta,
+                in: targetSectionId,
+                additionalDelayNs: fastNavigation ? 250_000_000 : 0
+            )
+
+            let needsSeriesVideosOrCanonicalId = !AniListMetaBuilder.isAniListID(settledMeta.id)
+                && ((settledMeta.isSeries && (settledMeta.videos?.isEmpty ?? true))
+                    || DetailsPlayTargetPredictor.isNonCanonicalStreamId(settledMeta.streamId))
+
             // Third-party catalog responses are often intentionally compact
             // and omit runtime/status and shelf artwork. Once focus settles,
             // ask for the full metadata record in the background and fill the missing fields.
-            guard settledMeta.needsHeroMetadataEnrichment else { return }
+            guard settledMeta.needsHeroMetadataEnrichment || needsSeriesVideosOrCanonicalId else { return }
             enrichSettledCatalogMeta(settledMeta, in: targetSectionId)
+        }
+    }
+
+    @MainActor
+    private func triggerHomeDwellStreamPrefetch(
+        for meta: NuvioMeta,
+        in sectionId: String,
+        additionalDelayNs: UInt64 = 0
+    ) {
+        let prefetchEnabled = (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true
+        guard prefetchEnabled,
+              isActive,
+              !isFullScreenOverlayPresented,
+              !isDetailsOrPlayerOverlayPresented else {
+            return
+        }
+
+        let continueItem: ContinueWatchingItem? = {
+            if RemoteTrackingState.isProgressSourceAuthenticated {
+                return TraktProgressService.currentContinueWatchingItem(for: meta)
+            }
+            return ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id)
+        }()
+        let watchedKeys = WatchedStore.currentSnapshot().watchedEpisodeKeys(meta: meta)
+        guard let predicted = DetailsPlayTargetPredictor.predict(
+            meta: meta,
+            continueItem: continueItem,
+            watchedKeys: watchedKeys
+        ) else {
+            return
+        }
+
+        focusWork.streamPrefetchTask?.cancel()
+        focusWork.streamPrefetchTask = Task { @MainActor in
+            if additionalDelayNs > 0 {
+                try? await Task.sleep(nanoseconds: additionalDelayNs)
+                guard !Task.isCancelled else { return }
+            }
+            guard isActive,
+                  !isFullScreenOverlayPresented,
+                  !isDetailsOrPlayerOverlayPresented,
+                  focusWork.pendingFocusedMeta?.id == meta.id,
+                  focusWork.pendingSectionId == sectionId,
+                  focusWork.pendingFocusedFolder == nil else {
+                return
+            }
+            StreamsRepository.shared.prefetch(
+                type: predicted.contentType,
+                videoId: predicted.streamId,
+                season: predicted.episode?.season,
+                episode: predicted.episode?.episode
+            )
         }
     }
 
@@ -10236,6 +10389,7 @@ struct TVHomeView: View {
             focusedMeta = merged
             focusWork.pendingFocusedMeta = merged
             TVHomeDebugTrace.log("hero.enrich published cached hero item=\(settledMeta.id)")
+            triggerHomeDwellStreamPrefetch(for: merged, in: sectionId)
             return
         }
 
@@ -10266,6 +10420,7 @@ struct TVHomeView: View {
             focusedMeta = merged
             focusWork.pendingFocusedMeta = merged
             TVHomeDebugTrace.log("hero.enrich published merged hero item=\(settledMeta.id)")
+            triggerHomeDwellStreamPrefetch(for: merged, in: sectionId)
         }
     }
 

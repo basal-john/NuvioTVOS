@@ -122,6 +122,10 @@ struct DetailsScreen: View {
     @State private var preResolutionIdentity: DetailsBackgroundResolutionIdentity?
     @State private var preResolutionGeneration: UInt64 = 0
     @State private var prewarmedSavedTarget: DetailsSavedPlaybackTarget?
+    @State private var episodeDwellPrefetchTask: Task<Void, Never>? = nil
+    @State private var seasonPrefetchTask: Task<Void, Never>? = nil
+    @State private var nPlusOnePrefetchTask: Task<Void, Never>? = nil
+    @State private var lastNPlusOnePrefetchedKey: String? = nil
     /// True while a torrent stream is being resolved through the debrid provider,
     /// so the picker can keep its spinner up instead of appearing to hang.
     @State private var isResolvingDebrid = false
@@ -350,7 +354,14 @@ struct DetailsScreen: View {
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
                         let streamId = canonicalEpisodeStreamId(for: video, meta: viewModel.uiState.meta)
-                        let isPreFetched = (viewModel.prefetchedStreamId == streamId && !viewModel.uiState.streams.isEmpty)
+                        let hasCached = StreamsRepository.shared.cachedState(
+                            forType: "series",
+                            videoId: streamId,
+                            season: video.season,
+                            episode: video.episode
+                        ) != nil
+                        let isPreFetched = hasCached
+                            || (viewModel.prefetchedStreamId == streamId && (!viewModel.uiState.streams.isEmpty || viewModel.uiState.isLoadingStreams))
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched)
                     },
                     onEpisodePlayManually: { video in
@@ -361,9 +372,23 @@ struct DetailsScreen: View {
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
                         let streamId = canonicalEpisodeStreamId(for: video, meta: viewModel.uiState.meta)
-                        let isPreFetched = (viewModel.prefetchedStreamId == streamId && !viewModel.uiState.streams.isEmpty)
+                        let hasCached = StreamsRepository.shared.cachedState(
+                            forType: "series",
+                            videoId: streamId,
+                            season: video.season,
+                            episode: video.episode
+                        ) != nil
+                        let isPreFetched = hasCached
+                            || (viewModel.prefetchedStreamId == streamId && (!viewModel.uiState.streams.isEmpty || viewModel.uiState.isLoadingStreams))
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched, forceManualPicker: true)
                     },
+                    onEpisodeDwellPrefetch: { video in
+                        scheduleEpisodeDwellPrefetch(for: video)
+                    },
+                    onSeasonSwitchPrefetch: { season, episodes, watchedKeys in
+                        scheduleSeasonSwitchPrefetch(season: season, seasonEpisodes: episodes, watchedKeys: watchedKeys)
+                    },
+                    playPrefetchProgress: playPrefetchProgress,
                     onEpisodeMenuPresented: { isPresented in
                         isEpisodeMenuPresented = isPresented
                     },
@@ -472,6 +497,7 @@ struct DetailsScreen: View {
                         streamPickerAvailabilityMessage = nil
                         pendingStreamPickerResumePosition = nil
                         isStreamPickerPresented = false
+                        restoreDefaultTargetStreamsIfNeeded()
                     }
                 )
                 .ignoresSafeArea()
@@ -501,9 +527,11 @@ struct DetailsScreen: View {
                 isSmartPlaybackPending = false
                 isResolvingDebrid = false
                 isPreparingPlayback = false
+                restoreDefaultTargetStreamsIfNeeded()
             } else if isStreamPickerPresented {
                 pendingStreamPickerResumePosition = nil
                 isStreamPickerPresented = false
+                restoreDefaultTargetStreamsIfNeeded()
             } else {
                 handleBack()
             }
@@ -512,6 +540,10 @@ struct DetailsScreen: View {
         .onChange(of: viewModel.uiState.isLoadingStreams) { _, isLoading in
             if !isLoading {
                 finishSmartPlaybackIfPossible()
+                scheduleNextEpisodeLookaheadIfReady()
+            } else {
+                nPlusOnePrefetchTask?.cancel()
+                nPlusOnePrefetchTask = nil
             }
             performBackgroundAutoSelectionAndPreResolution()
         }
@@ -525,7 +557,14 @@ struct DetailsScreen: View {
                     viewModel.triggerStreamPreFetch(for: meta)
                 }
                 performBackgroundAutoSelectionAndPreResolution()
+                scheduleNextEpisodeLookaheadIfReady()
             } else {
+                episodeDwellPrefetchTask?.cancel()
+                episodeDwellPrefetchTask = nil
+                seasonPrefetchTask?.cancel()
+                seasonPrefetchTask = nil
+                nPlusOnePrefetchTask?.cancel()
+                nPlusOnePrefetchTask = nil
                 resetPreResolutionCandidate()
                 streamDiscoveryDuration = nil
             }
@@ -592,6 +631,7 @@ struct DetailsScreen: View {
                 viewModel.refreshWatchlistAndWatchedStatus()
             }
             presentInitialStreamPickerIfNeeded()
+            restoreDefaultTargetStreamsIfNeeded()
             performBackgroundAutoSelectionAndPreResolution()
         }
         .onDisappear {
@@ -614,6 +654,42 @@ struct DetailsScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: LibraryStore.changedNotification).receive(on: RunLoop.main)) { _ in
             viewModel.refreshWatchlistAndWatchedStatus()
         }
+        .onReceive(NotificationCenter.default.publisher(for: TraktProgressService.continueWatchingSnapshotChangedNotification).receive(on: RunLoop.main)) { _ in
+            syncPrefetchTargetAfterExternalStateChange()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            syncPrefetchTargetAfterExternalStateChange()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
+            syncPrefetchTargetAfterExternalStateChange()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            viewModel.refreshWatchlistAndWatchedStatus()
+            syncPrefetchTargetAfterExternalStateChange()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+            syncPrefetchTargetAfterExternalStateChange()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            syncPrefetchTargetAfterExternalStateChange()
+        }
+    }
+
+    private func syncPrefetchTargetAfterExternalStateChange() {
+        guard isDetailsPlaybackContextActive,
+              !didHandOffPlayback,
+              pendingEpisode == nil,
+              !isStreamPickerPresented,
+              !isSmartPlaybackPending,
+              !isResolvingDebrid,
+              !isPreparingPlayback,
+              !isPreparingInitialPlayback,
+              let meta = viewModel.uiState.meta,
+              meta.matches(id: id) else {
+            return
+        }
+        viewModel.syncStreamsToDefaultPlayTargetIfNeeded(for: meta)
+        performBackgroundAutoSelectionAndPreResolution()
     }
 
     /// Stop Details work before asking the parent to remove this screen.
@@ -893,7 +969,10 @@ struct DetailsScreen: View {
             let hasStreamsForTarget = viewModel.requestedStreamId == targetStreamId
                 && (!viewModel.uiState.streams.isEmpty || viewModel.uiState.isLoadingStreams)
             if reload || !hasStreamsForTarget {
-                viewModel.prepareStreams(forId: targetStreamId, type: type, forceRefresh: forceManualPicker)
+                let shouldForceRefresh = forceManualPicker && viewModel.requestedStreamId == targetStreamId
+                    && !viewModel.uiState.isLoadingStreams
+                    && viewModel.uiState.streams.isEmpty
+                viewModel.prepareStreams(forId: targetStreamId, type: type, forceRefresh: shouldForceRefresh)
             }
             if !viewModel.uiState.streams.isEmpty {
                 let saved = streamDiscoveryDuration ?? (viewModel.prefetchStartTime.map { Date().timeIntervalSince($0) } ?? 0)
@@ -967,8 +1046,13 @@ struct DetailsScreen: View {
         isPreparingPlayback = false
         isStreamPickerPresented = false
 
-        if reload {
-            viewModel.prepareStreams(forId: targetStreamId, type: type, forceRefresh: true)
+        let hasTargetLoadedOrLoading = viewModel.requestedStreamId == targetStreamId
+            && (!viewModel.uiState.streams.isEmpty || viewModel.uiState.isLoadingStreams)
+        if reload || !hasTargetLoadedOrLoading {
+            let shouldForceRefresh = viewModel.requestedStreamId == targetStreamId
+                && !viewModel.uiState.isLoadingStreams
+                && viewModel.uiState.streams.isEmpty
+            viewModel.prepareStreams(forId: targetStreamId, type: type, forceRefresh: shouldForceRefresh)
         }
         finishSmartPlaybackIfPossible(meta: meta)
     }
@@ -1105,8 +1189,190 @@ struct DetailsScreen: View {
         }
     }
 
+    private var playPrefetchProgress: TvDetailsPrefetchProgress {
+        guard let meta = viewModel.uiState.meta else { return .hidden }
+        let isSeries = meta.isSeries || NuvioMeta.isSeriesType(meta.type)
+        let defaultTarget = isSeries ? viewModel.resolveDefaultPlayTarget(for: meta) : nil
+        let expectedStreamId = defaultTarget?.streamId ?? meta.streamId
+        let expectedEpisode = defaultTarget?.episode
+        let targetPlayable = !expectedStreamId.isEmpty && !DetailsViewModel.isNonCanonicalStreamId(expectedStreamId)
+        let isLiveOrSports = DetailsPlayTargetPredictor.isLiveOrSports(meta)
+        let savedTarget = prewarmedSavedTarget ?? savedPlaybackTarget(
+            for: meta,
+            episode: expectedEpisode,
+            profileID: ProfileSettings.activeProfileID,
+            manualPicker: false
+        )
+        let targetMatchesRequest = viewModel.requestedStreamId == expectedStreamId
+        let cachedFallbackState = targetMatchesRequest
+            ? nil
+            : StreamsRepository.shared.cachedState(
+                forType: isSeries ? "series" : meta.type,
+                videoId: expectedStreamId,
+                season: expectedEpisode?.season,
+                episode: expectedEpisode?.episode
+            )
+        let hasPreResolvedForTarget = preResolvedURL != nil && preResolvedStreamId == expectedStreamId
+        let debridEnabled = DebridResolver(store: ProfileSettings.current).isEnabled
+        let discoverySnapshot = StreamsDiscoveryState(
+            groups: viewModel.uiState.streamGroups,
+            isAnyLoading: viewModel.uiState.isLoadingStreams,
+            hasResolvedTargets: !viewModel.uiState.streamGroups.isEmpty || !viewModel.uiState.isLoadingStreams
+        )
+        return TvDetailsPrefetchProgressEvaluator.evaluateWithCachedFallback(
+            enabled: backgroundStreamPreFetch,
+            isPlayable: targetPlayable,
+            isLiveOrSports: isLiveOrSports,
+            hasSavedTarget: savedTarget != nil,
+            hasPreResolvedURL: hasPreResolvedForTarget,
+            isResolvingDebrid: preFetchDebridTask != nil && preResolutionIdentity?.streamID == expectedStreamId,
+            smartStreamSelection: smartStreamSelection,
+            debridEnabled: debridEnabled,
+            targetMatchesRequest: targetMatchesRequest,
+            isLoadingStreams: viewModel.uiState.isLoadingStreams,
+            streamGroups: viewModel.uiState.streamGroups,
+            playableStreamCount: discoverySnapshot.playableStreamCount,
+            cachedFallbackState: cachedFallbackState
+        )
+    }
+
+    private func restoreDefaultTargetStreamsIfNeeded() {
+        pendingEpisode = nil
+        pendingEpisodeSubtitle = ""
+        guard isDetailsPlaybackContextActive,
+              !isStreamPickerPresented,
+              !isSmartPlaybackPending,
+              !isResolvingDebrid,
+              !isPreparingPlayback,
+              !isPreparingInitialPlayback,
+              let meta = viewModel.uiState.meta,
+              meta.matches(id: id) else {
+            return
+        }
+        viewModel.syncStreamsToDefaultPlayTargetIfNeeded(for: meta)
+        performBackgroundAutoSelectionAndPreResolution()
+    }
+
+    private func scheduleEpisodeDwellPrefetch(for video: NuvioVideo) {
+        episodeDwellPrefetchTask?.cancel()
+        episodeDwellPrefetchTask = nil
+        guard backgroundStreamPreFetch,
+              isDetailsPlaybackContextActive,
+              !didHandOffPlayback,
+              let meta = viewModel.uiState.meta,
+              EpisodeReleasePolicy.hasAired(video.released) else { return }
+        let streamId = canonicalEpisodeStreamId(for: video, meta: meta)
+        guard !streamId.isEmpty, !DetailsViewModel.isNonCanonicalStreamId(streamId) else { return }
+        episodeDwellPrefetchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled,
+                  self.backgroundStreamPreFetch,
+                  self.isDetailsPlaybackContextActive,
+                  !self.didHandOffPlayback else { return }
+            self.episodeDwellPrefetchTask = nil
+            guard self.viewModel.requestedStreamId != streamId else { return }
+            StreamsRepository.shared.prefetch(
+                type: "series",
+                videoId: streamId,
+                season: video.season,
+                episode: video.episode
+            )
+        }
+    }
+
+    private func scheduleSeasonSwitchPrefetch(
+        season: Int,
+        seasonEpisodes: [NuvioVideo],
+        watchedKeys: Set<String>
+    ) {
+        seasonPrefetchTask?.cancel()
+        seasonPrefetchTask = nil
+        guard backgroundStreamPreFetch,
+              isDetailsPlaybackContextActive,
+              !didHandOffPlayback,
+              let meta = viewModel.uiState.meta,
+              let target = DetailsPlayTargetPredictor.targetEpisode(
+                  forSeason: season,
+                  in: seasonEpisodes,
+                  watchedKeys: watchedKeys
+              ) else { return }
+        let streamId = canonicalEpisodeStreamId(for: target, meta: meta)
+        guard !streamId.isEmpty, !DetailsViewModel.isNonCanonicalStreamId(streamId) else { return }
+        seasonPrefetchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled,
+                  self.backgroundStreamPreFetch,
+                  self.isDetailsPlaybackContextActive,
+                  !self.didHandOffPlayback else { return }
+            self.seasonPrefetchTask = nil
+            guard self.viewModel.requestedStreamId != streamId else { return }
+            StreamsRepository.shared.prefetch(
+                type: "series",
+                videoId: streamId,
+                season: target.season,
+                episode: target.episode
+            )
+        }
+    }
+
+    private func scheduleNextEpisodeLookaheadIfReady() {
+        nPlusOnePrefetchTask?.cancel()
+        nPlusOnePrefetchTask = nil
+        guard backgroundStreamPreFetch,
+              isDetailsPlaybackContextActive,
+              !didHandOffPlayback,
+              !isStreamPickerPresented,
+              !viewModel.uiState.isLoadingStreams,
+              episodeDwellPrefetchTask == nil,
+              seasonPrefetchTask == nil,
+              let meta = viewModel.uiState.meta,
+              meta.isSeries || NuvioMeta.isSeriesType(meta.type),
+              let currentEpisode = viewModel.prefetchedEpisode,
+              let nextEpisode = DetailsPlayTargetPredictor.nextAiredEpisode(
+                  after: currentEpisode,
+                  in: meta.videos ?? []
+              ) else { return }
+        let nextStreamId = canonicalEpisodeStreamId(for: nextEpisode, meta: meta)
+        guard !nextStreamId.isEmpty,
+              !DetailsViewModel.isNonCanonicalStreamId(nextStreamId),
+              nextStreamId != viewModel.prefetchedStreamId,
+              lastNPlusOnePrefetchedKey != nextStreamId,
+              StreamsRepository.shared.cachedState(
+                  forType: "series",
+                  videoId: nextStreamId,
+                  season: nextEpisode.season,
+                  episode: nextEpisode.episode
+              ) == nil else { return }
+        nPlusOnePrefetchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled,
+                  self.backgroundStreamPreFetch,
+                  self.isDetailsPlaybackContextActive,
+                  !self.didHandOffPlayback,
+                  !self.isStreamPickerPresented,
+                  !self.viewModel.uiState.isLoadingStreams,
+                  self.episodeDwellPrefetchTask == nil,
+                  self.seasonPrefetchTask == nil else { return }
+            self.nPlusOnePrefetchTask = nil
+            self.lastNPlusOnePrefetchedKey = nextStreamId
+            StreamsRepository.shared.prefetch(
+                type: "series",
+                videoId: nextStreamId,
+                season: nextEpisode.season,
+                episode: nextEpisode.episode
+            )
+        }
+    }
+
     private func cleanupPreFetchedResources() {
         playbackPrewarmer.endContext()
+        episodeDwellPrefetchTask?.cancel()
+        episodeDwellPrefetchTask = nil
+        seasonPrefetchTask?.cancel()
+        seasonPrefetchTask = nil
+        nPlusOnePrefetchTask?.cancel()
+        nPlusOnePrefetchTask = nil
+        lastNPlusOnePrefetchedKey = nil
         if preFetchDebridTask != nil || preResolvedURL != nil || backgroundPreResolutionTask != nil {
             print("[PreFetch] 🛑 Details view dismissed — cancelled pending background pre-resolution tasks and cleaned up pre-loaded resources.")
         }
@@ -1152,6 +1418,7 @@ struct DetailsScreen: View {
                     if let requestID = pendingInitialPlaybackRequestID {
                         finishInitialPlaybackRequest(requestID)
                     }
+                    restoreDefaultTargetStreamsIfNeeded()
                 }
             )
             .transition(.opacity)
@@ -4432,6 +4699,9 @@ struct TvDetailsContent: View {
     var onHostWatchParty: ((NuvioVideo?) -> Void)? = nil
     let onEpisodeSelected: (NuvioVideo) -> Void
     var onEpisodePlayManually: ((NuvioVideo) -> Void)? = nil
+    var onEpisodeDwellPrefetch: ((NuvioVideo) -> Void)? = nil
+    var onSeasonSwitchPrefetch: ((Int, [NuvioVideo], Set<String>) -> Void)? = nil
+    var playPrefetchProgress: TvDetailsPrefetchProgress = .hidden
     var onEpisodeMenuPresented: ((Bool) -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
@@ -4463,7 +4733,6 @@ struct TvDetailsContent: View {
     /// The episode strip holds its episodes' focus and Details only hears of it, so a move along
     /// the strip redraws the strip, not all of Details. Details puts focus on an episode by asking the strip.
     @State private var episodeFocusRequest = TvEpisodeFocusRequest()
-    @State private var isTrailerParkedForScroll = false
     /// The section that currently owns focus. Other sections expose only their
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
@@ -4500,10 +4769,6 @@ struct TvDetailsContent: View {
     @State private var shuffleRevision = 0
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.reuseLastLink) private var reuseLastLink = false
-    @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
-    @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = true
-    @AppStorage(SettingsKey.trailerSound) private var trailerSound = false
-    @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = false
     @State private var configuredDetailsSections: [TVDetailsSection] = TVDetailsSectionOrder.currentOrder()
     @State private var disabledDetailsSections: Set<TVDetailsSection> = TVDetailsSectionOrder.disabledSections()
@@ -4515,7 +4780,6 @@ struct TvDetailsContent: View {
     @State private var isTrailerPlaying = false
     @State private var isTrailerRenderReady = false
     @State private var isFullscreenTrailerPresented = false
-    @State private var didStopTrailerManually = false
     @State private var trailerTask: Task<Void, Never>? = nil
     /// Bumped whenever a watched mark or a progress write lands. Resume progress
     /// is read straight from the stores below rather than from `uiState`, so
@@ -4530,82 +4794,19 @@ struct TvDetailsContent: View {
     @State private var reentryProgressRefreshPending = false
     @StateObject private var episodeCache = TvDetailsEpisodeCache()
 
-    private func isBackgroundTrailerAllowed(hasHandoff: Bool = false) -> Bool {
-        guard trailersEnabled && backgroundTrailersEnabled && !didStopTrailerManually && isEnabled else { return false }
-        return true
-    }
-
-    private func scheduleBackgroundTrailer(for meta: NuvioMeta) {
-        trailerTask?.cancel()
-        let handoff = TrailerPlaybackHandoff.shared.takeHandoff(for: meta.id)
-        let hasHandoff = handoff != nil
-        guard isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else {
-            stopBackgroundTrailer(manual: false)
-            return
-        }
-
-        trailerTask = Task { @MainActor in
-            if !hasHandoff {
-                let delaySeconds = max(0, trailerDelay)
-                if delaySeconds > 0 {
-                    try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
-                }
-            }
-            guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
-
-            let playbackSource: TrailerPlaybackSource?
-            if let source = handoff?.playbackSource {
-                playbackSource = source
-            } else {
-                playbackSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta)
-            }
-
-            guard let playbackSource,
-                  !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else {
-                return
-            }
-
-            guard let item = playbackSource.makePlayerItem() else { return }
-            guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
-
-            trailerPlayer.replaceCurrentItem(with: item)
-
-            if let handoffTime = handoff?.time, handoffTime > 0.1 {
-                await trailerPlayer.seek(
-                    to: CMTime(seconds: handoffTime, preferredTimescale: 600),
-                    toleranceBefore: .zero,
-                    toleranceAfter: .zero
-                )
-            }
-            applySoundPreference(trailerSound)
-            isTrailerPlaying = true
-            trailerPlayer.play()
-        }
-    }
-
     private func presentFullscreenTrailer() {
-        if isTrailerPlaying && trailerPlayer.currentItem != nil {
-            applySoundPreference(true)
-            trailerPlayer.play()
-            withAnimation(.easeInOut(duration: 0.22)) {
-                isFullscreenTrailerPresented = true
-            }
-        } else if let meta = uiState.meta {
-            withAnimation(.easeInOut(duration: 0.22)) {
-                isFullscreenTrailerPresented = true
-            }
-            startFullscreenTrailer(for: meta)
+        guard let meta = uiState.meta else { return }
+        withAnimation(.easeInOut(duration: 0.22)) {
+            isFullscreenTrailerPresented = true
         }
+        startFullscreenTrailer(for: meta)
     }
 
     private func dismissFullscreenTrailer() {
         withAnimation(.easeInOut(duration: 0.22)) {
             isFullscreenTrailerPresented = false
         }
-        applySoundPreference(trailerSound)
-        if !isBackgroundTrailerAllowed() {
-            stopBackgroundTrailer(manual: false)
-        }
+        stopTrailerPlayback()
         DispatchQueue.main.async {
             actionFocus = .more
         }
@@ -4613,12 +4814,10 @@ struct TvDetailsContent: View {
 
     private func startFullscreenTrailer(for meta: NuvioMeta) {
         trailerTask?.cancel()
-        let handoff = TrailerPlaybackHandoff.shared.takeHandoff(for: meta.id)
+        _ = TrailerPlaybackHandoff.shared.takeHandoff(for: meta.id)
         trailerTask = Task { @MainActor in
             let playbackSource: TrailerPlaybackSource?
-            if let source = handoff?.playbackSource {
-                playbackSource = source
-            } else if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
+            if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
                 playbackSource = source
             } else {
                 playbackSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta)
@@ -4633,44 +4832,19 @@ struct TvDetailsContent: View {
             guard !Task.isCancelled else { return }
 
             trailerPlayer.replaceCurrentItem(with: item)
-
-            if let handoffTime = handoff?.time, handoffTime > 0.1 {
-                await trailerPlayer.seek(
-                    to: CMTime(seconds: handoffTime, preferredTimescale: 600),
-                    toleranceBefore: .zero,
-                    toleranceAfter: .zero
-                )
-            }
             applySoundPreference(true)
             isTrailerPlaying = true
             trailerPlayer.play()
         }
     }
 
-    private func stopBackgroundTrailer(manual: Bool) {
+    private func stopTrailerPlayback() {
         trailerTask?.cancel()
         trailerTask = nil
-        if manual {
-            didStopTrailerManually = true
-        }
         isTrailerPlaying = false
         isTrailerRenderReady = false
-        isTrailerParkedForScroll = false
         trailerPlayer.pause()
         trailerPlayer.replaceCurrentItem(with: nil)
-    }
-
-    private func updateTrailerParkingForScroll() {
-        let shouldPark = isScrolledDown
-            && isTrailerPlaying
-            && !isFullscreenTrailerPresented
-        guard shouldPark != isTrailerParkedForScroll else { return }
-        isTrailerParkedForScroll = shouldPark
-        if shouldPark {
-            trailerPlayer.pause()
-        } else if isTrailerPlaying, !isFullscreenTrailerPresented {
-            trailerPlayer.play()
-        }
     }
 
     private func handleEpisodeFocusChange(_ newFocus: String?) {
@@ -4696,7 +4870,6 @@ struct TvDetailsContent: View {
     private func setEpisodeFocused(_ focused: Bool) {
         guard isEpisodeFocused != focused else { return }
         isEpisodeFocused = focused
-        updateTrailerParkingForScroll()
     }
 
     /// The episode control holding focus, as the strip reported it.
@@ -4723,15 +4896,7 @@ struct TvDetailsContent: View {
             dismissFullscreenTrailer()
             return
         }
-        if isTrailerPlaying {
-            if let metaId = uiState.meta?.id {
-                let seconds = trailerPlayer.currentTime().seconds
-                if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
-                    TrailerPlaybackHandoff.shared.recordHandoff(metaId: metaId, time: seconds)
-                }
-            }
-        }
-        stopBackgroundTrailer(manual: false)
+        stopTrailerPlayback()
         onBack()
     }
 
@@ -4758,16 +4923,8 @@ struct TvDetailsContent: View {
     private func backdropView(for meta: NuvioMeta) -> some View {
         TvDetailsBackdrop(
             meta: meta,
-            blurRadius: backdropBlurRadius,
-            player: isFullscreenTrailerPresented ? nil : trailerPlayer,
-            isTrailerVisible: isTrailerPlaying && isTrailerRenderReady && !isFullscreenTrailerPresented && !isTrailerParkedForScroll,
-            onTrailerReadyForDisplay: handleTrailerReady
+            blurRadius: backdropBlurRadius
         )
-    }
-
-    private func handleTrailerReady() {
-        guard isTrailerPlaying, !isTrailerRenderReady else { return }
-        isTrailerRenderReady = true
     }
 
     private func hasStoredPlaybackStream(for playTarget: TvDetailsPlayTarget) -> Bool {
@@ -4801,11 +4958,13 @@ struct TvDetailsContent: View {
                 meta: meta,
                 playTarget: playTarget,
                 continueItem: continueItem,
-                canBypassPicker: canBypassPicker
+                canBypassPicker: canBypassPicker,
+                prefetchNote: playPrefetchProgress.phase == .hidden ? nil : playPrefetchProgress.statusNote
             ),
             playHint: canBypassPicker
                 ? L10n.string("details_play_hint_smart", fallback: "Plays the best link. Hold Select to choose a source manually.")
                 : L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources"),
+            playPrefetchProgress: playPrefetchProgress.phase == .hidden ? nil : playPrefetchProgress.fraction,
             onPlayClick: {
                 handlePlayClick(playTarget: playTarget)
             },
@@ -4844,19 +5003,19 @@ struct TvDetailsContent: View {
             showMdbListRating: showMdbListRating,
             onRateClick: onRateClick != nil ? {
                 cancelFocusRestoration()
-                stopBackgroundTrailer(manual: false)
+                stopTrailerPlayback()
                 onRateClick?()
             } : nil,
             aniListTitle: aniListButtonTitle,
             onAniListClick: (AniListSettings.showsDetailsButton && aniListTarget != nil) ? {
                 cancelFocusRestoration()
-                stopBackgroundTrailer(manual: false)
+                stopTrailerPlayback()
                 showingAniListMenu = true
             } : nil,
             malTitle: MALAccount.buttonTitle(malStatus),
             onMALClick: (MALSettings.showsDetailsButton && malID != nil) ? {
                 cancelFocusRestoration()
-                stopBackgroundTrailer(manual: false)
+                stopTrailerPlayback()
                 showingMALMenu = true
             } : nil,
             onTrailerClick: {
@@ -4926,7 +5085,7 @@ struct TvDetailsContent: View {
                     },
                     onSelect: { video in
                         cancelFocusRestoration()
-                        stopBackgroundTrailer(manual: false)
+                        stopTrailerPlayback()
                         if isChoosingWatchPartyEpisode {
                             isChoosingWatchPartyEpisode = false
                             onHostWatchParty?(video)
@@ -4936,9 +5095,11 @@ struct TvDetailsContent: View {
                     },
                     onPlayManually: onEpisodePlayManually != nil ? { video in
                         cancelFocusRestoration()
-                        stopBackgroundTrailer(manual: false)
+                        stopTrailerPlayback()
                         onEpisodePlayManually?(video)
                     } : nil,
+                    onEpisodeDwellPrefetch: onEpisodeDwellPrefetch,
+                    onSeasonSwitchPrefetch: onSeasonSwitchPrefetch,
                     onEpisodeMenuPresented: { isPresented in
                         if isPresented { cancelFocusRestoration() }
                         onEpisodeMenuPresented?(isPresented)
@@ -4983,7 +5144,7 @@ struct TvDetailsContent: View {
                         guard !clean.isEmpty && clean != "cast" else { return }
                         // AniList characters have no TMDB page to open.
                         guard !AniListMetaBuilder.isAniListID(meta.id) else { return }
-                        stopBackgroundTrailer(manual: false)
+                        stopTrailerPlayback()
                         onOpenPerson?(
                             person,
                             DetailsFocusTarget(kind: .cast, itemID: person.id),
@@ -5211,7 +5372,7 @@ struct TvDetailsContent: View {
                 shuffleRevision &+= 1
                 return
             }
-            stopBackgroundTrailer(manual: false)
+            stopTrailerPlayback()
             shuffleRevision &+= 1
             guard let first = EpisodeShuffle.shared.start(
                 seriesID: meta.id,
@@ -5224,7 +5385,7 @@ struct TvDetailsContent: View {
 
     private func handlePlayClick(playTarget: TvDetailsPlayTarget) {
         cancelFocusRestoration()
-        stopBackgroundTrailer(manual: false)
+        stopTrailerPlayback()
         guard playTarget.isPlayable else { return }
         if let episode = playTarget.episode {
             onEpisodeSelected(episode)
@@ -5235,7 +5396,7 @@ struct TvDetailsContent: View {
 
     private func handlePlayLongPress(playTarget: TvDetailsPlayTarget) {
         cancelFocusRestoration()
-        stopBackgroundTrailer(manual: false)
+        stopTrailerPlayback()
         guard playTarget.isPlayable else { return }
         if let episode = playTarget.episode {
             if let onEpisodePlayManually {
@@ -5256,7 +5417,7 @@ struct TvDetailsContent: View {
         scrollProxy: ScrollViewProxy
     ) {
         cancelFocusRestoration()
-        stopBackgroundTrailer(manual: false)
+        stopTrailerPlayback()
         guard meta.isSeries else {
             onHostWatchParty?(nil)
             return
@@ -5363,9 +5524,7 @@ struct TvDetailsContent: View {
                                         TvDetailsSummary(
                                             meta: meta,
                                             creators: DetailsCreditLine.creators(in: uiState.people),
-                                            simkl: uiState.simklRatings,
-                                            isBackgroundTrailerPlaying: isTrailerPlaying && isTrailerRenderReady,
-                                            isSynopsisFocused: false
+                                            simkl: uiState.simklRatings
                                         )
                                         .frame(maxWidth: 840, alignment: .bottomLeading)
                                         .padding(.bottom, 6)
@@ -5440,9 +5599,6 @@ struct TvDetailsContent: View {
                             withTransaction(transaction) {
                                 scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
                             }
-                        }
-                        .onChange(of: isScrolledDown) { _, _ in
-                            updateTrailerParkingForScroll()
                         }
                         .onAppear {
                             if let initialFocusTarget {
@@ -5526,7 +5682,6 @@ struct TvDetailsContent: View {
                         DispatchQueue.main.async { actionFocus = .play }
                     }
                 }
-                scheduleBackgroundTrailer(for: meta)
             }
             .onReceive(NotificationCenter.default.publisher(for: TVDetailsSectionOrder.changedNotification).receive(on: RunLoop.main)) { _ in
                 configuredDetailsSections = TVDetailsSectionOrder.currentOrder()
@@ -5548,45 +5703,20 @@ struct TvDetailsContent: View {
             .onDisappear {
                 clearRestoredCastFocusHandoff()
                 cancelFocusRestoration()
-                let seconds = trailerPlayer.currentTime().seconds
-                if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
-                    TrailerPlaybackHandoff.shared.recordHandoff(metaId: meta.id, time: seconds)
-                }
-                stopBackgroundTrailer(manual: false)
+                stopTrailerPlayback()
             }
             .onChange(of: meta.id) { _, _ in
-                didStopTrailerManually = false
-                stopBackgroundTrailer(manual: false)
-                scheduleBackgroundTrailer(for: meta)
-            }
-            .onChange(of: backgroundTrailersEnabled) { _, enabled in
-                if !enabled {
-                    stopBackgroundTrailer(manual: false)
+                if isFullscreenTrailerPresented {
+                    dismissFullscreenTrailer()
                 } else {
-                    scheduleBackgroundTrailer(for: meta)
+                    stopTrailerPlayback()
                 }
-            }
-            .onChange(of: trailersEnabled) { _, enabled in
-                if !enabled {
-                    stopBackgroundTrailer(manual: false)
-                } else {
-                    scheduleBackgroundTrailer(for: meta)
-                }
-            }
-            .onChange(of: trailerDelay) { _, _ in
-                if isTrailerPlaying || trailerTask != nil {
-                    stopBackgroundTrailer(manual: false)
-                    scheduleBackgroundTrailer(for: meta)
-                }
-            }
-            .onChange(of: trailerSound) { _, soundEnabled in
-                applySoundPreference(isFullscreenTrailerPresented ? true : soundEnabled)
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase != .active {
                     cancelFocusRestoration()
                     trailerPlayer.pause()
-                } else if isTrailerPlaying {
+                } else if isFullscreenTrailerPresented, isTrailerPlaying {
                     trailerPlayer.play()
                 }
             }
@@ -5600,7 +5730,11 @@ struct TvDetailsContent: View {
                       item == trailerPlayer.currentItem else {
                     return
                 }
-                stopBackgroundTrailer(manual: false)
+                if isFullscreenTrailerPresented {
+                    dismissFullscreenTrailer()
+                } else {
+                    stopTrailerPlayback()
+                }
             }
             // Opening the stream picker disables this content, and on the way
             // back tvOS re-places focus geometrically — which is how leaving an
@@ -5613,7 +5747,7 @@ struct TvDetailsContent: View {
                     cancelFocusRestoration()
                     restoreGeneration &+= 1
                     restoreEpisodeKey = currentEpisodeFocus
-                    stopBackgroundTrailer(manual: false)
+                    stopTrailerPlayback()
                 } else {
                     refreshProgressAfterReturn()
                     if let target = restoreEpisodeKey {
@@ -5663,6 +5797,13 @@ struct TvDetailsContent: View {
             .onReceive(
                 NotificationCenter.default.publisher(
                     for: TraktSettingsStore.continueWatchingChangedNotification
+                ).receive(on: RunLoop.main)
+            ) { _ in
+                progressRevision &+= 1
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: TraktProgressService.continueWatchingSnapshotChangedNotification
                 ).receive(on: RunLoop.main)
             ) { _ in
                 progressRevision &+= 1
@@ -6148,7 +6289,7 @@ struct TvDetailsContent: View {
                 )
             } : nil,
             onSelect: { item in
-                stopBackgroundTrailer(manual: false)
+                stopTrailerPlayback()
                 let resolvedCardId: String = {
                     if item.id.hasPrefix("tt") { return item.id }
                     if let cachedImdb = CinemetaCatalogRepository.cachedMetadata(for: item.id)?.imdbId, cachedImdb.hasPrefix("tt") {
@@ -6380,9 +6521,6 @@ private struct TvDetailsScrollTransitionShadow: View {
 private struct TvDetailsBackdrop: View {
     let meta: NuvioMeta
     var blurRadius: CGFloat = 0
-    var player: AVPlayer? = nil
-    var isTrailerVisible: Bool = false
-    var onTrailerReadyForDisplay: (() -> Void)? = nil
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
@@ -6403,16 +6541,10 @@ private struct TvDetailsBackdrop: View {
 
     init(
         meta: NuvioMeta,
-        blurRadius: CGFloat = 0,
-        player: AVPlayer? = nil,
-        isTrailerVisible: Bool = false,
-        onTrailerReadyForDisplay: (() -> Void)? = nil
+        blurRadius: CGFloat = 0
     ) {
         self.meta = meta
         self.blurRadius = blurRadius
-        self.player = player
-        self.isTrailerVisible = isTrailerVisible
-        self.onTrailerReadyForDisplay = onTrailerReadyForDisplay
 
         var cachedInitial: UIImage? = nil
         for candidate in [meta.backgroundUrl, meta.landscapePosterUrl, meta.posterUrl] {
@@ -6452,19 +6584,6 @@ private struct TvDetailsBackdrop: View {
                 }
             } else {
                 backdropColor.ignoresSafeArea()
-            }
-
-            if let player {
-                TrailerPlayerSurface(player: player) {
-                    onTrailerReadyForDisplay?()
-                }
-                .scaleEffect(1.35)
-                .blur(radius: blurRadius, opaque: true)
-                .opacity(isTrailerVisible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.35), value: isTrailerVisible)
-                .animation(.easeInOut(duration: 0.35), value: blurRadius)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
             }
 
             GeometryReader { proxy in
@@ -6624,6 +6743,151 @@ private struct TvDetailsLogo: View {
     }
 }
 
+struct TvDetailsPrefetchProgress: Equatable {
+    enum Phase: Equatable {
+        case hidden
+        case searching
+        case resolvingDebrid
+        case ready
+    }
+
+    let fraction: Double
+    let phase: Phase
+    let playableCount: Int
+    let statusNote: String?
+
+    static let hidden = TvDetailsPrefetchProgress(
+        fraction: 0,
+        phase: .hidden,
+        playableCount: 0,
+        statusNote: nil
+    )
+}
+
+enum TvDetailsPrefetchProgressEvaluator {
+    static func evaluate(
+        enabled: Bool,
+        isPlayable: Bool,
+        isLiveOrSports: Bool,
+        hasSavedTarget: Bool,
+        hasPreResolvedURL: Bool,
+        isResolvingDebrid: Bool,
+        smartStreamSelection: Bool,
+        debridEnabled: Bool,
+        targetMatchesRequest: Bool,
+        isLoadingStreams: Bool,
+        streamGroups: [AddonStreamGroup],
+        playableStreamCount: Int
+    ) -> TvDetailsPrefetchProgress {
+        guard enabled, isPlayable, !isLiveOrSports else {
+            return .hidden
+        }
+        if hasSavedTarget || (smartStreamSelection && hasPreResolvedURL) {
+            let label = playableStreamCount > 0
+                ? "\(playableStreamCount) \(playableStreamCount == 1 ? "source" : "sources") ready"
+                : "Stream ready"
+            return TvDetailsPrefetchProgress(
+                fraction: 1.0,
+                phase: .ready,
+                playableCount: playableStreamCount,
+                statusNote: label
+            )
+        }
+        if isResolvingDebrid && targetMatchesRequest {
+            return TvDetailsPrefetchProgress(
+                fraction: 0.85,
+                phase: .resolvingDebrid,
+                playableCount: playableStreamCount,
+                statusNote: playableStreamCount > 0 ? "Preparing stream (\(playableStreamCount))" : "Preparing stream…"
+            )
+        }
+        guard targetMatchesRequest else {
+            return TvDetailsPrefetchProgress(
+                fraction: 0.08,
+                phase: .searching,
+                playableCount: 0,
+                statusNote: "Checking sources…"
+            )
+        }
+
+        if isLoadingStreams {
+            let includeDebridTail = smartStreamSelection && debridEnabled
+            let discovery = StreamsDiscoveryState(
+                groups: streamGroups,
+                isAnyLoading: true,
+                hasResolvedTargets: !streamGroups.isEmpty
+            )
+            let fraction = discovery.discoveryProgress(includeDebridTail: includeDebridTail)
+            let note = playableStreamCount > 0
+                ? "Found \(playableStreamCount) \(playableStreamCount == 1 ? "source" : "sources")…"
+                : "Checking sources…"
+            return TvDetailsPrefetchProgress(
+                fraction: fraction,
+                phase: .searching,
+                playableCount: playableStreamCount,
+                statusNote: note
+            )
+        }
+
+        let note = playableStreamCount > 0
+            ? "\(playableStreamCount) \(playableStreamCount == 1 ? "source" : "sources") ready"
+            : "No sources found"
+        return TvDetailsPrefetchProgress(
+            fraction: 1.0,
+            phase: .ready,
+            playableCount: playableStreamCount,
+            statusNote: note
+        )
+    }
+
+    static func evaluateWithCachedFallback(
+        enabled: Bool,
+        isPlayable: Bool,
+        isLiveOrSports: Bool,
+        hasSavedTarget: Bool,
+        hasPreResolvedURL: Bool,
+        isResolvingDebrid: Bool,
+        smartStreamSelection: Bool,
+        debridEnabled: Bool,
+        targetMatchesRequest: Bool,
+        isLoadingStreams: Bool,
+        streamGroups: [AddonStreamGroup],
+        playableStreamCount: Int,
+        cachedFallbackState: StreamsDiscoveryState?
+    ) -> TvDetailsPrefetchProgress {
+        if !targetMatchesRequest, let cachedFallbackState {
+            return evaluate(
+                enabled: enabled,
+                isPlayable: isPlayable,
+                isLiveOrSports: isLiveOrSports,
+                hasSavedTarget: hasSavedTarget,
+                hasPreResolvedURL: hasPreResolvedURL,
+                isResolvingDebrid: isResolvingDebrid,
+                smartStreamSelection: smartStreamSelection,
+                debridEnabled: debridEnabled,
+                targetMatchesRequest: true,
+                isLoadingStreams: cachedFallbackState.isAnyLoading || !cachedFallbackState.hasResolvedTargets,
+                streamGroups: cachedFallbackState.groups,
+                playableStreamCount: cachedFallbackState.playableStreamCount
+            )
+        }
+        return evaluate(
+            enabled: enabled,
+            isPlayable: isPlayable,
+            isLiveOrSports: isLiveOrSports,
+            hasSavedTarget: hasSavedTarget,
+            hasPreResolvedURL: hasPreResolvedURL,
+            isResolvingDebrid: isResolvingDebrid,
+            smartStreamSelection: smartStreamSelection,
+            debridEnabled: debridEnabled,
+            targetMatchesRequest: targetMatchesRequest,
+            isLoadingStreams: isLoadingStreams,
+            streamGroups: streamGroups,
+            playableStreamCount: playableStreamCount
+        )
+    }
+}
+
 /// Pure text formatting helpers for the Apple TV split details hero.
 enum TvDetailsHeroFormatter {
     static func yearOrDate(for meta: NuvioMeta, showFullDates: Bool) -> String? {
@@ -6658,7 +6922,8 @@ enum TvDetailsHeroFormatter {
         meta: NuvioMeta,
         playTarget: TvDetailsPlayTarget,
         continueItem: ContinueWatchingItem?,
-        canBypassPicker: Bool
+        canBypassPicker: Bool,
+        prefetchNote: String? = nil
     ) -> String? {
         var parts: [String] = []
         if let continueItem, !continueItem.isUpNextEntry {
@@ -6674,6 +6939,10 @@ enum TvDetailsHeroFormatter {
                     parts.append(remaining)
                 }
             }
+        }
+        if let prefetchNote = prefetchNote?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !prefetchNote.isEmpty {
+            parts.append(prefetchNote)
         }
         if canBypassPicker {
             if parts.isEmpty {
@@ -6816,6 +7085,7 @@ private struct TvDetailsActionRow: View {
     var playTitle: String = L10n.string("action_play", fallback: "Play")
     var playSubtext: String? = nil
     var playHint: String = L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources")
+    var playPrefetchProgress: Double? = nil
     let onPlayClick: () -> Void
     var onPlayLongPress: (() -> Void)? = nil
     /// Series only: plays a random episode, and Up Next stays random.
@@ -6853,6 +7123,7 @@ private struct TvDetailsActionRow: View {
                 fillWidth: true,
                 height: 86,
                 cornerRadius: 20,
+                progressFraction: playPrefetchProgress,
                 focus: focus,
                 tag: .play,
                 action: onPlayClick,
@@ -7237,6 +7508,7 @@ private struct TvDetailsActionButton: View {
     var fixedWidth: CGFloat? = nil
     var height: CGFloat = 86
     var cornerRadius: CGFloat = 20
+    var progressFraction: Double? = nil
     var focus: FocusState<DetailsActionFocus?>.Binding
     let tag: DetailsActionFocus
     let action: () -> Void
@@ -7245,6 +7517,7 @@ private struct TvDetailsActionButton: View {
     var onBack: (() -> Void)? = nil
 
     @State private var didTriggerHold = false
+    @State private var progressOpacity: Double = 1
     private var isFocused: Bool { focus.wrappedValue == tag }
 
     var body: some View {
@@ -7283,6 +7556,27 @@ private struct TvDetailsActionButton: View {
                 maxHeight: height
             )
             .modifier(TvDetailsGlassBackground(filled: isPrimary || isFocused, shape: shape))
+            .overlay(alignment: .bottom) {
+                if let fraction = progressFraction, isPrimary {
+                    GeometryReader { barProxy in
+                        let clamped = min(max(fraction, 0), 1)
+                        ZStack(alignment: .leading) {
+                            Capsule()
+                                .fill(Color.black.opacity(0.14))
+                            Capsule()
+                                .fill(Color.black.opacity(clamped >= 0.999 ? 0.85 : 0.76))
+                                .frame(width: max(8, barProxy.size.width * clamped))
+                                .animation(.easeOut(duration: 0.28), value: clamped)
+                        }
+                    }
+                    .frame(height: 3.5)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 5)
+                    .opacity(progressOpacity)
+                    .allowsHitTesting(false)
+                }
+            }
+            .clipShape(shape)
             .overlay(
                 shape.stroke(
                     Color.white.opacity((isPrimary || isFocused) ? 0 : 0.20),
@@ -7290,6 +7584,26 @@ private struct TvDetailsActionButton: View {
                 )
             )
             .shadow(color: .black.opacity(isFocused ? 0.35 : 0.18), radius: isFocused ? 18 : 7, y: 8)
+        }
+        .task(id: progressFraction) {
+            guard isPrimary, let fraction = progressFraction else {
+                progressOpacity = 0
+                return
+            }
+            if fraction >= 0.999 {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    progressOpacity = 1
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeOut(duration: 0.35)) {
+                    progressOpacity = 0
+                }
+            } else {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    progressOpacity = 1
+                }
+            }
         }
         .buttonStyle(TvPlayActionButtonStyle(onHold: longPressAction, didTriggerHold: $didTriggerHold))
         .focused(focus, equals: tag)
@@ -7335,15 +7649,6 @@ private struct TvDetailsSummary: View {
     /// The series' creators, from TMDB's "created by"; empty when unknown.
     var creators: [String] = []
     var simkl: SimklTitleRatings? = nil
-    var isBackgroundTrailerPlaying: Bool = false
-    var isSynopsisFocused: Bool = false
-
-    private var textOpacity: Double {
-        if isBackgroundTrailerPlaying && !isSynopsisFocused {
-            return 0.85
-        }
-        return 1.0
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -7366,8 +7671,6 @@ private struct TvDetailsSummary: View {
                 TvDetailsRatingsRow(badges: externalRatingBadges)
             }
         }
-        .opacity(textOpacity)
-        .animation(.easeInOut(duration: 0.35), value: textOpacity)
     }
 
     @ViewBuilder
@@ -9311,11 +9614,16 @@ struct TvDetailsEpisodeWatchedKeys {
     let display: Set<String>
     let playTarget: Set<String>
 
+    static func playTargetKeys(for meta: NuvioMeta, progressSnapshot: WatchedSnapshot) -> Set<String> {
+        let aniList = AniListAccount.watchedEpisodeKeys(meta: meta).union(PlexWatched.watchedEpisodeKeys(meta: meta))
+        return progressSnapshot.watchedEpisodeKeys(meta: meta).union(aniList)
+    }
+
     init(meta: NuvioMeta, progressSnapshot: WatchedSnapshot, librarySnapshot: WatchedSnapshot?) {
         // Settings → Integrations → AniList: episodes as far as the viewer's AniList progress.
         // AniList progress, and episodes Plex has as watched.
         let aniList = AniListAccount.watchedEpisodeKeys(meta: meta).union(PlexWatched.watchedEpisodeKeys(meta: meta))
-        playTarget = progressSnapshot.watchedEpisodeKeys(meta: meta).union(aniList)
+        playTarget = Self.playTargetKeys(for: meta, progressSnapshot: progressSnapshot)
         display = (librarySnapshot?.catalogWatchedEpisodeKeys(meta: meta) ?? playTarget).union(aniList)
     }
 }
@@ -9424,10 +9732,16 @@ private final class TvDetailsEpisodeCache: ObservableObject {
                     ? (presentation?.revision.selection ?? -1) &+ 1
                     : (presentation?.revision.selection ?? 0)
             )
+            let resolvedPlayTarget = playTargetBuilder(guide.episodes, continueItem, progressWatchedKeys)
+            if meta.isSeries || NuvioMeta.isSeriesType(meta.type) {
+                let firstRegular = guide.episodes.first(where: { $0.season > 0 }).map { "S\($0.season)E\($0.episode)" } ?? "none"
+                let cwCode = continueItem?.episodeNumbers.map { "S\($0.season)E\($0.episode)" } ?? "nil"
+                print("[PreFetch][UI] title=\"\(meta.name)\" eps=\(guide.episodes.count) firstS=\(firstRegular) cw=\(cwCode) watched=\(progressWatchedKeys.count) target=\"\(resolvedPlayTarget.label)\"")
+            }
             presentation = TvDetailsEpisodePresentation(
                 guide: guide,
                 continueItem: continueItem,
-                playTarget: playTargetBuilder(guide.episodes, continueItem, progressWatchedKeys),
+                playTarget: resolvedPlayTarget,
                 initialState: initialState,
                 revision: nextRevision
             )
@@ -9455,6 +9769,8 @@ private struct TvDetailsEpisodes: View {
     let onFocus: () -> Void
     let onSelect: (NuvioVideo) -> Void
     var onPlayManually: ((NuvioVideo) -> Void)? = nil
+    var onEpisodeDwellPrefetch: ((NuvioVideo) -> Void)? = nil
+    var onSeasonSwitchPrefetch: ((Int, [NuvioVideo], Set<String>) -> Void)? = nil
     let onEpisodeMenuPresented: (Bool) -> Void
     var onBack: (() -> Void)? = nil
     var episodeFocusRequest: TvEpisodeFocusRequest? = nil
@@ -9501,6 +9817,8 @@ private struct TvDetailsEpisodes: View {
         onFocus: @escaping () -> Void,
         onSelect: @escaping (NuvioVideo) -> Void,
         onPlayManually: ((NuvioVideo) -> Void)? = nil,
+        onEpisodeDwellPrefetch: ((NuvioVideo) -> Void)? = nil,
+        onSeasonSwitchPrefetch: ((Int, [NuvioVideo], Set<String>) -> Void)? = nil,
         onEpisodeMenuPresented: @escaping (Bool) -> Void,
         onBack: (() -> Void)? = nil,
         episodeFocusRequest: TvEpisodeFocusRequest? = nil,
@@ -9522,6 +9840,8 @@ private struct TvDetailsEpisodes: View {
         self.onFocus = onFocus
         self.onSelect = onSelect
         self.onPlayManually = onPlayManually
+        self.onEpisodeDwellPrefetch = onEpisodeDwellPrefetch
+        self.onSeasonSwitchPrefetch = onSeasonSwitchPrefetch
         self.onEpisodeMenuPresented = onEpisodeMenuPresented
         self.onBack = onBack
         self.episodeFocusRequest = episodeFocusRequest
@@ -9599,7 +9919,11 @@ private struct TvDetailsEpisodes: View {
             }
         }
         .onChange(of: selectedSeason) { _, newSeason in
-            setSeasonEpisodes(episodeGuide.episodesBySeason[newSeason] ?? [])
+            let updatedEpisodes = episodeGuide.episodesBySeason[newSeason] ?? []
+            setSeasonEpisodes(updatedEpisodes)
+            if userDidSelectSeason {
+                onSeasonSwitchPrefetch?(newSeason, updatedEpisodes, watchedEpisodeKeys)
+            }
         }
         .onChange(of: restrictFocusToKey) { _, newKey in
             guard let newKey, newKey.hasPrefix("episode-card\u{1}") else { return }
@@ -9613,6 +9937,12 @@ private struct TvDetailsEpisodes: View {
         }
         .onChange(of: ownEpisodeFocus) { _, key in
             onEpisodeFocusChange?(key)
+            if let key, key.hasPrefix("episode-card\u{1}") {
+                let targetID = String(key.dropFirst("episode-card\u{1}".count))
+                if let episode = seasonEpisodes.first(where: { $0.id == targetID }) {
+                    onEpisodeDwellPrefetch?(episode)
+                }
+            }
         }
         .onChange(of: episodeFocusRequest) { _, request in
             applyEpisodeFocusRequest(request)

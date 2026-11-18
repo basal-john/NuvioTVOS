@@ -804,7 +804,7 @@ enum TmdbDetailsService {
             .compactMap { nonEmpty($0.name) }
             .nilIfEmpty
         let tmdbPosterURL = useArtwork ? imageURL(details.posterPath, size: "w500") : nil
-        let tmdbBackgroundURL = useArtwork ? imageURL(details.backdropPath, size: "w1280") : nil
+        let tmdbBackgroundURL = useArtwork ? imageURL(details.backdropPath, size: "original") : nil
         let tmdbLogoPath = useArtwork
             ? preferredLogoPath(from: details.images?.logos)
             : nil
@@ -868,7 +868,7 @@ enum TmdbDetailsService {
         }
         guard isEnabled, apiKey != nil, useArtwork, tmdbId > 0,
               let details = await fetchLocalizedDetails(tmdbId: tmdbId, mediaType: mediaType) else { return nil }
-        let background = imageURL(details.backdropPath, size: "w1280")
+        let background = imageURL(details.backdropPath, size: "original")
         let logo = imageURL(preferredLogoPath(from: details.images?.logos), size: "w500")
         guard background != nil || logo != nil else { return nil }
         return (background, logo)
@@ -1295,7 +1295,7 @@ enum TmdbDetailsService {
             year: year,
             rating: item.voteAverage.flatMap { $0 > 0 ? $0 : nil },
             overview: item.overview?.trimmingCharacters(in: .whitespacesAndNewlines),
-            backdropURL: imageURL(item.backdropPath, size: "w1280")
+            backdropURL: imageURL(item.backdropPath, size: "original")
         )
     }
 
@@ -2070,7 +2070,7 @@ extension TmdbDetailsService {
                 name: name,
                 description: item.overview?.trimmingCharacters(in: .whitespacesAndNewlines),
                 posterUrl: imageURL(item.posterPath, size: "w500"),
-                backgroundUrl: imageURL(item.backdropPath, size: "w1280"),
+                backgroundUrl: imageURL(item.backdropPath, size: "original"),
                 tmdbId: item.id,
                 type: type,
                 year: (item.releaseDate ?? item.firstAirDate).flatMap { Int($0.prefix(4)) },

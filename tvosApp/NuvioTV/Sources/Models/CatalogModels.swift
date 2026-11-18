@@ -1363,6 +1363,24 @@ extension NuvioMeta {
         }
         return rawId
     }
+
+    /// Builds a canonical `tt1234567:season:episode` lookup id even when
+    /// compact metadata (e.g., Continue Watching) omits the episode guide.
+    func canonicalEpisodeStreamId(forSeason season: Int, episode: Int) -> String? {
+        guard season > 0, episode > 0 else { return nil }
+        let parentId = streamId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !parentId.isEmpty else { return nil }
+        if let metaIMDbId = Self.canonicalImdbID(from: parentId) {
+            return "\(metaIMDbId):\(season):\(episode)"
+        }
+        guard !parentId.hasPrefix("tmdb:"),
+              !parentId.hasPrefix("simkl:"),
+              !parentId.hasPrefix("trakt:"),
+              !parentId.hasPrefix("wetrakr:") else {
+            return nil
+        }
+        return "\(parentId):\(season):\(episode)"
+    }
 }
 
 enum EpisodeReleasePolicy {
@@ -2217,6 +2235,36 @@ struct StreamsDiscoveryState {
 
     var hasAnyStreams: Bool {
         groups.contains { !$0.streams.isEmpty }
+    }
+
+    /// Total number of discovered stream add-on/local/Jellyfin groups.
+    var totalGroupCount: Int {
+        groups.count
+    }
+
+    /// Number of stream groups that have finished loading.
+    var completedGroupCount: Int {
+        groups.filter { !$0.isLoading }.count
+    }
+
+    /// Count of streams that have a concrete URL or torrent infoHash and are playable.
+    var playableStreamCount: Int {
+        groups.reduce(0) { count, group in
+            count + group.streams.filter { !$0.isNotPlayable && ($0.url != nil || $0.infoHash != nil) }.count
+        }
+    }
+
+    /// Normalizes add-on stream discovery progress (`0.08 ... 1.0`), reserving
+    /// the tail end for Debrid link resolution / prewarm when `includeDebridTail` is true.
+    func discoveryProgress(includeDebridTail: Bool = false) -> Double {
+        guard hasResolvedTargets else { return 0.08 }
+        if !isAnyLoading {
+            return includeDebridTail ? 0.85 : 1.0
+        }
+        guard !groups.isEmpty else { return 0.15 }
+        let ratio = Double(completedGroupCount) / Double(groups.count)
+        let maxDiscoveryFraction = includeDebridTail ? 0.78 : 0.92
+        return min(maxDiscoveryFraction, max(0.14, 0.14 + ratio * (maxDiscoveryFraction - 0.14)))
     }
 }
 

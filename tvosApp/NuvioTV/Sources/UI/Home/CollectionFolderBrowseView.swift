@@ -53,6 +53,7 @@ struct CollectionFolderBrowseView: View {
     @State private var focusRestoreGeneration = 0
     @State private var cachedCollectionMetadata: [String: NuvioMeta] = [:]
     @State private var collectionEnrichmentTask: Task<Void, Never>?
+    @State private var collectionStreamPrefetchTask: Task<Void, Never>?
     @State private var backgroundEnrichmentTasks: [Task<Void, Never>] = []
     @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -141,6 +142,8 @@ struct CollectionFolderBrowseView: View {
             TVHomeDebugTrace.log("collectionFolder.disappear id=\(folder.id)")
             collectionEnrichmentTask?.cancel()
             collectionEnrichmentTask = nil
+            collectionStreamPrefetchTask?.cancel()
+            collectionStreamPrefetchTask = nil
             backgroundEnrichmentTasks.forEach { $0.cancel() }
             backgroundEnrichmentTasks.removeAll()
         }
@@ -150,7 +153,13 @@ struct CollectionFolderBrowseView: View {
             await addonCatalogNames
         }
         .onChange(of: focusedItemID) { _, newValue in
-            if let newValue { lastFocusedItemID = newValue }
+            if let newValue {
+                lastFocusedItemID = newValue
+                scheduleStreamPrefetchForFocusedID(newValue)
+            } else {
+                collectionStreamPrefetchTask?.cancel()
+                collectionStreamPrefetchTask = nil
+            }
         }
         .onChange(of: isLoading) { _, loading in
             if loading {
@@ -161,6 +170,8 @@ struct CollectionFolderBrowseView: View {
         }
         .onChange(of: isEnabled) { _, enabled in
             if !enabled {
+                collectionStreamPrefetchTask?.cancel()
+                collectionStreamPrefetchTask = nil
                 focusRestoreGeneration &+= 1
                 if let focusedItemID { lastFocusedItemID = focusedItemID }
             } else if let target = lastFocusedItemID {
@@ -792,6 +803,82 @@ struct CollectionFolderBrowseView: View {
             cachedCollectionMetadata[key] = fullMeta
             applyCollectionMetadata(fullMeta, to: item.id)
         }
+    }
+
+    private func scheduleStreamPrefetchForFocusedID(_ focusID: String) {
+        let prefetchEnabled = (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true
+        guard prefetchEnabled, isEnabled else { return }
+
+        guard let item = focusedMetaItem(forFocusID: focusID) else { return }
+
+        collectionStreamPrefetchTask?.cancel()
+        collectionStreamPrefetchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 280_000_000)
+            guard !Task.isCancelled, isEnabled, focusedItemID == focusID else { return }
+
+            let key = "\(item.type.lowercased())\u{1f}\(item.id)"
+            let enrichedMeta = cachedCollectionMetadata[key].map { item.fillingMissingHeroMetadata(from: $0) } ?? item
+
+            if let predicted = predictStreamPrefetchTarget(for: enrichedMeta) {
+                StreamsRepository.shared.prefetch(
+                    type: predicted.contentType,
+                    videoId: predicted.streamId,
+                    season: predicted.episode?.season,
+                    episode: predicted.episode?.episode
+                )
+                return
+            }
+
+            guard !DetailsPlayTargetPredictor.isLiveOrSports(enrichedMeta),
+                  !AniListMetaBuilder.isAniListID(enrichedMeta.id),
+                  let fetched = try? await repository.getMetadata(id: enrichedMeta.id, type: enrichedMeta.type),
+                  !Task.isCancelled,
+                  isEnabled,
+                  focusedItemID == focusID else {
+                return
+            }
+
+            cachedCollectionMetadata[key] = fetched
+            applyCollectionMetadata(fetched, to: enrichedMeta.id)
+            let merged = enrichedMeta.fillingMissingHeroMetadata(from: fetched)
+            if let predicted = predictStreamPrefetchTarget(for: merged) {
+                StreamsRepository.shared.prefetch(
+                    type: predicted.contentType,
+                    videoId: predicted.streamId,
+                    season: predicted.episode?.season,
+                    episode: predicted.episode?.episode
+                )
+            }
+        }
+    }
+
+    private func focusedMetaItem(forFocusID focusID: String) -> NuvioMeta? {
+        if let separator = focusID.firstIndex(of: "\u{1}") {
+            let rowID = String(focusID[..<separator])
+            let itemID = String(focusID[focusID.index(after: separator)...])
+            if let row = catalogRows.first(where: { $0.id == rowID }),
+               let match = row.items.first(where: { $0.id == itemID }) {
+                return match
+            }
+        }
+        return displayedGridItems.first(where: { $0.id == focusID })
+            ?? items.first(where: { $0.id == focusID })
+            ?? catalogRows.lazy.flatMap(\.items).first(where: { $0.id == focusID })
+    }
+
+    private func predictStreamPrefetchTarget(for meta: NuvioMeta) -> PredictedPlayTarget? {
+        let continueItem: ContinueWatchingItem? = {
+            if RemoteTrackingState.isProgressSourceAuthenticated {
+                return TraktProgressService.currentContinueWatchingItem(for: meta)
+            }
+            return ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id)
+        }()
+        let watchedKeys = WatchedStore.currentSnapshot().watchedEpisodeKeys(meta: meta)
+        return DetailsPlayTargetPredictor.predict(
+            meta: meta,
+            continueItem: continueItem,
+            watchedKeys: watchedKeys
+        )
     }
 
     private func applyCollectionMetadata(_ fullMeta: NuvioMeta, to itemID: String) {

@@ -2707,10 +2707,16 @@ struct TraktProgressService {
         Set(items.map {
             let imdb = NuvioMeta.canonicalImdbID(from: $0.meta.imdbId ?? "") ?? ""
             let tmdb = $0.meta.tmdbId.map(String.init) ?? ""
-            return "\($0.meta.canonicalType):\($0.meta.id):\(imdb):\(tmdb)"
+            let season = $0.episodeNumbers.map { String($0.season) } ?? ""
+            let episode = $0.episodeNumbers.map { String($0.episode) } ?? ""
+            return "\($0.meta.canonicalType):\($0.meta.id):\(imdb):\(tmdb):\(season):\(episode):\($0.isUpNextEntry ? 1 : 0)"
         })
             .sorted()
             .joined(separator: ",")
+    }
+
+    static func continueWatchingSnapshotIdentityForTesting(_ items: [ContinueWatchingItem]) -> String {
+        continueWatchingIdentity(items)
     }
 
     /// Returns whether the snapshot actually lost a row.

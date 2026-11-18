@@ -11,7 +11,8 @@ import Foundation
 
 /// Shared stream discovery used by Details and player source switching.
 /// Jobs outlive DetailsViewModel so playback / leaving details never cancel
-/// an in-flight search.
+/// an in-flight search, and a bounded multi-entry LRU cache keeps prefetched
+/// movie/episode results warm across cards and seasons.
 @MainActor
 final class StreamsRepository: ObservableObject {
     static let shared = StreamsRepository()
@@ -20,20 +21,133 @@ final class StreamsRepository: ObservableObject {
     /// finish as failed without blocking the rest or smart autoplay forever.
     nonisolated static let streamRequestTimeout: TimeInterval = 15
 
+    /// Maximum age (seconds) for reusing a completed cached discovery result.
+    nonisolated static let defaultCacheTTL: TimeInterval = 300
+
+    /// Maximum number of title/episode discovery snapshots held in the LRU cache.
+    nonisolated static let defaultMaxCacheEntries: Int = 8
+
     /// Shared URLSession used for Jellyfin `PlaybackInfo` requests; overridable in tests.
     nonisolated(unsafe) static var jellyfinSession: URLSession = .shared
 
+    struct CacheConfiguration: Equatable {
+        let addonManifestURLs: [URL]
+        let jellyfinTargetKeys: [String]
+    }
+
+    private struct CachedDiscoveryEntry {
+        var state: StreamsDiscoveryState
+        var config: CacheConfiguration
+        var updatedAt: Date
+        var lastAccessedAt: Date
+    }
+
+    typealias DiscoveryPublisher = @MainActor (
+        _ groups: [AddonStreamGroup],
+        _ isAnyLoading: Bool,
+        _ emptyStateReason: StreamsEmptyStateReason?,
+        _ hasResolvedTargets: Bool
+    ) -> Void
+
+    typealias DiscoveryHandler = @MainActor (
+        _ requestKey: String,
+        _ type: String,
+        _ videoId: String,
+        _ config: CacheConfiguration,
+        _ publish: @escaping DiscoveryPublisher
+    ) async -> Void
+
     @Published private(set) var state = StreamsDiscoveryState()
+    /// Incremented whenever the background LRU cache is updated so observers/tests
+    /// can track background prefetch without disturbing foreground `state`.
+    @Published private(set) var backgroundCacheRevision: UInt64 = 0
 
     private var activeJob: Task<Void, Never>?
+    private var activeJobToken: UUID?
     private var activeRequestKey: String?
     private var activeAddonManifestURLs: [URL]?
     private var activeJellyfinTargetKeys: [String]?
 
+    private var backgroundPrefetchJob: Task<Void, Never>?
+    private var backgroundPrefetchToken: UUID?
+    private var backgroundPrefetchKey: String?
+    private var backgroundPrefetchConfig: CacheConfiguration?
+
+    private var discoveryCache: [String: CachedDiscoveryEntry] = [:]
+    private let maxCacheEntries: Int
+    private let cacheTTL: TimeInterval
+    private let nowProvider: () -> Date
+    private let configuredAddonsProvider: () -> [URL]
+    private let customDiscoveryHandler: DiscoveryHandler?
+
     /// Actor-backed success-only cache (no permanent failure entries).
     private static let manifestCache = StreamManifestCache()
 
-    private init() {}
+    private init(
+        maxCacheEntries: Int = StreamsRepository.defaultMaxCacheEntries,
+        cacheTTL: TimeInterval = StreamsRepository.defaultCacheTTL,
+        nowProvider: @escaping () -> Date = Date.init,
+        configuredAddonsProvider: @escaping () -> [URL] = { CinemetaCatalogRepository.configuredStreamAddonManifestURLs },
+        discoveryHandler: DiscoveryHandler? = nil
+    ) {
+        self.maxCacheEntries = max(1, maxCacheEntries)
+        self.cacheTTL = cacheTTL
+        self.nowProvider = nowProvider
+        self.configuredAddonsProvider = configuredAddonsProvider
+        self.customDiscoveryHandler = discoveryHandler
+    }
+
+    static func makeForTesting(
+        maxCacheEntries: Int = defaultMaxCacheEntries,
+        cacheTTL: TimeInterval = defaultCacheTTL,
+        nowProvider: @escaping () -> Date = Date.init,
+        configuredAddonsProvider: @escaping () -> [URL] = { [] },
+        discoveryHandler: DiscoveryHandler? = nil
+    ) -> StreamsRepository {
+        StreamsRepository(
+            maxCacheEntries: maxCacheEntries,
+            cacheTTL: cacheTTL,
+            nowProvider: nowProvider,
+            configuredAddonsProvider: configuredAddonsProvider,
+            discoveryHandler: discoveryHandler
+        )
+    }
+
+    func cachedState(
+        forType type: String,
+        videoId: String,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> StreamsDiscoveryState? {
+        let se = (season == nil && episode == nil)
+            ? Self.seasonEpisode(fromVideoId: videoId)
+            : (season, episode)
+        let key = Self.requestKey(type: type, videoId: videoId, season: se.0, episode: se.1)
+        guard let entry = discoveryCache[key] else { return nil }
+        let addonManifestURLs = configuredAddonsProvider()
+        let jellyfinTargetKeys = jellyfinTargets(for: videoId, season: se.0, episode: se.1).map(\.cacheKey)
+        let currentConfig = CacheConfiguration(addonManifestURLs: addonManifestURLs, jellyfinTargetKeys: jellyfinTargetKeys)
+        guard entry.config == currentConfig else { return nil }
+        if !entry.state.isAnyLoading && nowProvider().timeIntervalSince(entry.updatedAt) >= cacheTTL {
+            return nil
+        }
+        return entry.state
+    }
+
+    var cachedKeysInOrderForTesting: [String] {
+        discoveryCache
+            .sorted { $0.value.lastAccessedAt > $1.value.lastAccessedAt }
+            .map(\.key)
+    }
+
+    func clearCache() {
+        backgroundPrefetchJob?.cancel()
+        backgroundPrefetchJob = nil
+        backgroundPrefetchToken = nil
+        backgroundPrefetchKey = nil
+        backgroundPrefetchConfig = nil
+        discoveryCache.removeAll()
+    }
 
     // MARK: - Request key
 
@@ -265,10 +379,15 @@ final class StreamsRepository: ObservableObject {
             ? Self.seasonEpisode(fromVideoId: videoId)
             : (season, episode)
         let key = Self.requestKey(type: type, videoId: videoId, season: se.0, episode: se.1)
-        let addonManifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
+        let addonManifestURLs = configuredAddonsProvider()
         let currentJellyfinTargets = jellyfinTargets(for: videoId, season: se.0, episode: se.1)
         let currentJellyfinTargetKeys = currentJellyfinTargets.map(\.cacheKey)
+        let currentConfig = CacheConfiguration(
+            addonManifestURLs: addonManifestURLs,
+            jellyfinTargetKeys: currentJellyfinTargetKeys
+        )
         let current = state
+        let now = nowProvider()
 
         if !forceRefresh,
            Self.requestConfigurationMatches(
@@ -279,28 +398,210 @@ final class StreamsRepository: ObservableObject {
             activeJellyfinTargetKeys: activeJellyfinTargetKeys,
             jellyfinTargetKeys: currentJellyfinTargetKeys),
            current.hasResolvedTargets || current.isAnyLoading || current.emptyStateReason != nil {
-            print("[StreamsRepo] skip reload key=\(key) groups=\(current.groups.count) loading=\(current.isAnyLoading)")
+            let expired: Bool = {
+                guard !current.isAnyLoading, let entry = discoveryCache[key] else { return false }
+                return now.timeIntervalSince(entry.updatedAt) >= cacheTTL
+            }()
+            if !expired {
+                if var entry = discoveryCache[key] {
+                    entry.lastAccessedAt = now
+                    discoveryCache[key] = entry
+                }
+                print("[StreamsRepo] skip reload key=\(key) groups=\(current.groups.count) loading=\(current.isAnyLoading)")
+                return
+            }
+        }
+
+        // Case B: Promote an in-flight background prefetch with matching key + config.
+        if !forceRefresh,
+           backgroundPrefetchKey == key,
+           backgroundPrefetchConfig == currentConfig,
+           let bgJob = backgroundPrefetchJob,
+           let bgToken = backgroundPrefetchToken {
+            activeJob?.cancel()
+            activeJob = bgJob
+            activeJobToken = bgToken
+            activeRequestKey = key
+            activeAddonManifestURLs = addonManifestURLs
+            activeJellyfinTargetKeys = currentJellyfinTargetKeys
+
+            backgroundPrefetchJob = nil
+            backgroundPrefetchToken = nil
+            backgroundPrefetchKey = nil
+            backgroundPrefetchConfig = nil
+
+            if var entry = discoveryCache[key] {
+                entry.lastAccessedAt = now
+                discoveryCache[key] = entry
+                state = StreamsDiscoveryState(
+                    requestKey: key,
+                    revision: state.revision &+ 1,
+                    groups: entry.state.groups,
+                    isAnyLoading: entry.state.isAnyLoading,
+                    emptyStateReason: entry.state.emptyStateReason,
+                    hasResolvedTargets: entry.state.hasResolvedTargets
+                )
+            } else {
+                state = StreamsDiscoveryState(
+                    requestKey: key,
+                    revision: state.revision &+ 1,
+                    groups: [],
+                    isAnyLoading: true,
+                    hasResolvedTargets: false
+                )
+            }
+            print("[StreamsRepo] promoted background prefetch -> foreground key=\(key)")
             return
         }
 
+        // Case C: Reuse a fresh completed snapshot from the multi-entry LRU cache.
+        if !forceRefresh,
+           var cachedEntry = discoveryCache[key],
+           cachedEntry.config == currentConfig,
+           !cachedEntry.state.isAnyLoading,
+           now.timeIntervalSince(cachedEntry.updatedAt) < cacheTTL {
+            activeJob?.cancel()
+            activeJob = nil
+            activeJobToken = nil
+            activeRequestKey = key
+            activeAddonManifestURLs = addonManifestURLs
+            activeJellyfinTargetKeys = currentJellyfinTargetKeys
+
+            cachedEntry.lastAccessedAt = now
+            discoveryCache[key] = cachedEntry
+
+            state = StreamsDiscoveryState(
+                requestKey: key,
+                revision: state.revision &+ 1,
+                groups: cachedEntry.state.groups,
+                isAnyLoading: false,
+                emptyStateReason: cachedEntry.state.emptyStateReason,
+                hasResolvedTargets: cachedEntry.state.hasResolvedTargets
+            )
+            print("[StreamsRepo] LRU cache hit key=\(key) groups=\(cachedEntry.state.groups.count) streams=\(cachedEntry.state.allStreams.count)")
+            return
+        }
+
+        // Case D: Cache miss or explicit forceRefresh.
+        if forceRefresh, backgroundPrefetchKey == key {
+            backgroundPrefetchJob?.cancel()
+            backgroundPrefetchJob = nil
+            backgroundPrefetchToken = nil
+            backgroundPrefetchKey = nil
+            backgroundPrefetchConfig = nil
+        }
+
+        let jobToken = UUID()
+        activeJob?.cancel()
+        activeJobToken = jobToken
         activeRequestKey = key
         activeAddonManifestURLs = addonManifestURLs
         activeJellyfinTargetKeys = currentJellyfinTargetKeys
-        state = StreamsDiscoveryState(
+
+        let initialLoadingState = StreamsDiscoveryState(
             requestKey: key,
             revision: state.revision &+ 1,
             groups: [],
             isAnyLoading: true,
             hasResolvedTargets: false
         )
-        activeJob?.cancel()
+        state = initialLoadingState
+        recordCacheSnapshot(initialLoadingState, key: key, config: currentConfig)
+
         activeJob = Task { [weak self] in
-            await self?.runDiscovery(
+            guard let self else { return }
+            await self.executeDiscovery(
                 requestKey: key,
                 type: type,
                 videoId: videoId,
-                addonManifestURLs: addonManifestURLs,
-                jellyfinTargets: currentJellyfinTargets
+                config: currentConfig,
+                jellyfinTargets: currentJellyfinTargets,
+                token: jobToken
+            )
+        }
+    }
+
+    /// Starts stream discovery in the background into the LRU cache without
+    /// interrupting any active foreground discovery or player source search.
+    func prefetch(
+        type: String,
+        videoId: String,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) {
+        let se = (season == nil && episode == nil)
+            ? Self.seasonEpisode(fromVideoId: videoId)
+            : (season, episode)
+        let key = Self.requestKey(type: type, videoId: videoId, season: se.0, episode: se.1)
+        let addonManifestURLs = configuredAddonsProvider()
+        let currentJellyfinTargets = jellyfinTargets(for: videoId, season: se.0, episode: se.1)
+        let currentJellyfinTargetKeys = currentJellyfinTargets.map(\.cacheKey)
+        let currentConfig = CacheConfiguration(
+            addonManifestURLs: addonManifestURLs,
+            jellyfinTargetKeys: currentJellyfinTargetKeys
+        )
+        let now = nowProvider()
+
+        // Already foreground active and valid/loading for this exact target.
+        if Self.requestConfigurationMatches(
+            activeRequestKey: activeRequestKey,
+            requestKey: key,
+            activeAddonManifestURLs: activeAddonManifestURLs,
+            configuredAddonManifestURLs: addonManifestURLs,
+            activeJellyfinTargetKeys: activeJellyfinTargetKeys,
+            jellyfinTargetKeys: currentJellyfinTargetKeys),
+           state.hasResolvedTargets || state.isAnyLoading || state.emptyStateReason != nil {
+            let expired: Bool = {
+                guard !state.isAnyLoading, let entry = discoveryCache[key] else { return false }
+                return now.timeIntervalSince(entry.updatedAt) >= cacheTTL
+            }()
+            if !expired {
+                return
+            }
+        }
+
+        // Fresh completed result already sitting in LRU cache.
+        if var entry = discoveryCache[key],
+           entry.config == currentConfig,
+           !entry.state.isAnyLoading,
+           now.timeIntervalSince(entry.updatedAt) < cacheTTL {
+            entry.lastAccessedAt = now
+            discoveryCache[key] = entry
+            return
+        }
+
+        // Already prefetching this exact key & configuration.
+        if backgroundPrefetchKey == key,
+           backgroundPrefetchConfig == currentConfig,
+           backgroundPrefetchJob != nil {
+            return
+        }
+
+        backgroundPrefetchJob?.cancel()
+        let jobToken = UUID()
+        backgroundPrefetchToken = jobToken
+        backgroundPrefetchKey = key
+        backgroundPrefetchConfig = currentConfig
+
+        let seedState = StreamsDiscoveryState(
+            requestKey: key,
+            revision: 1,
+            groups: [],
+            isAnyLoading: true,
+            hasResolvedTargets: false
+        )
+        recordCacheSnapshot(seedState, key: key, config: currentConfig)
+        backgroundCacheRevision &+= 1
+
+        backgroundPrefetchJob = Task { [weak self] in
+            guard let self else { return }
+            await self.executeDiscovery(
+                requestKey: key,
+                type: type,
+                videoId: videoId,
+                config: currentConfig,
+                jellyfinTargets: currentJellyfinTargets,
+                token: jobToken
             )
         }
     }
@@ -416,18 +717,162 @@ final class StreamsRepository: ObservableObject {
 
     // MARK: - Discovery
 
-    private func runDiscovery(requestKey: String, type: String, videoId: String,
-                              addonManifestURLs: [URL], jellyfinTargets: [JellyfinStreamTarget]) async {
-        guard !Task.isCancelled else { return }
+    private func isJobActive(requestKey: String, token: UUID) -> Bool {
+        let isForeground = (activeJobToken == token && activeRequestKey == requestKey)
+        let isBackground = (backgroundPrefetchToken == token && backgroundPrefetchKey == requestKey)
+        return isForeground || isBackground
+    }
+
+    private func finishJob(requestKey: String, token: UUID) {
+        if activeJobToken == token && activeRequestKey == requestKey {
+            activeJobToken = nil
+            activeJob = nil
+        }
+        if backgroundPrefetchToken == token && backgroundPrefetchKey == requestKey {
+            backgroundPrefetchToken = nil
+            backgroundPrefetchJob = nil
+            backgroundPrefetchKey = nil
+            backgroundPrefetchConfig = nil
+        }
+    }
+
+    private func recordCacheSnapshot(
+        _ snapshot: StreamsDiscoveryState,
+        key: String,
+        config: CacheConfiguration
+    ) {
+        let now = nowProvider()
+        discoveryCache[key] = CachedDiscoveryEntry(
+            state: snapshot,
+            config: config,
+            updatedAt: now,
+            lastAccessedAt: now
+        )
+        if discoveryCache.count > maxCacheEntries {
+            let overflow = discoveryCache.count - maxCacheEntries
+            let evictionCandidates = discoveryCache
+                .filter { $0.key != key && $0.key != activeRequestKey && $0.key != backgroundPrefetchKey }
+                .sorted { $0.value.lastAccessedAt < $1.value.lastAccessedAt }
+            for victim in evictionCandidates.prefix(overflow) {
+                discoveryCache.removeValue(forKey: victim.key)
+            }
+            // Fallback if active slots still exceed budget
+            if discoveryCache.count > maxCacheEntries {
+                let extra = discoveryCache.count - maxCacheEntries
+                let remaining = discoveryCache
+                    .filter { $0.key != key }
+                    .sorted { $0.value.lastAccessedAt < $1.value.lastAccessedAt }
+                for victim in remaining.prefix(extra) {
+                    discoveryCache.removeValue(forKey: victim.key)
+                }
+            }
+        }
+    }
+
+    private func currentGroups(forKey key: String) -> [AddonStreamGroup] {
+        discoveryCache[key]?.state.groups ?? []
+    }
+
+    private func publishForJob(
+        groups: [AddonStreamGroup],
+        requestKey: String,
+        config: CacheConfiguration,
+        token: UUID,
+        forceLoading: Bool,
+        hasResolvedTargets: Bool = true,
+        emptyReasonOverride: StreamsEmptyStateReason? = nil
+    ) {
+        guard isJobActive(requestKey: requestKey, token: token) else { return }
+        let groupLoading = groups.contains(where: \.isLoading)
+        let anyLoading = forceLoading || groupLoading
+        let emptyReason: StreamsEmptyStateReason? = emptyReasonOverride ?? {
+            if anyLoading { return nil }
+            if groups.contains(where: { !$0.streams.isEmpty }) { return nil }
+            if groups.isEmpty { return .noCompatibleAddons }
+            return .noStreamsFound
+        }()
+        let existingRevision = discoveryCache[requestKey]?.state.revision ?? 0
+        let cachedSnapshot = StreamsDiscoveryState(
+            requestKey: requestKey,
+            revision: existingRevision &+ 1,
+            groups: groups,
+            isAnyLoading: anyLoading,
+            emptyStateReason: emptyReason,
+            hasResolvedTargets: hasResolvedTargets
+        )
+        recordCacheSnapshot(cachedSnapshot, key: requestKey, config: config)
+
+        if activeJobToken == token && activeRequestKey == requestKey {
+            state = StreamsDiscoveryState(
+                requestKey: requestKey,
+                revision: state.revision &+ 1,
+                groups: groups,
+                isAnyLoading: anyLoading,
+                emptyStateReason: emptyReason,
+                hasResolvedTargets: hasResolvedTargets
+            )
+        } else {
+            backgroundCacheRevision &+= 1
+        }
+    }
+
+    private func executeDiscovery(
+        requestKey: String,
+        type: String,
+        videoId: String,
+        config: CacheConfiguration,
+        jellyfinTargets: [JellyfinStreamTarget],
+        token: UUID
+    ) async {
+        defer { finishJob(requestKey: requestKey, token: token) }
+
+        if let customDiscoveryHandler {
+            await customDiscoveryHandler(requestKey, type, videoId, config) { [weak self] groups, isAnyLoading, emptyReason, hasResolved in
+                self?.publishForJob(
+                    groups: groups,
+                    requestKey: requestKey,
+                    config: config,
+                    token: token,
+                    forceLoading: isAnyLoading,
+                    hasResolvedTargets: hasResolved,
+                    emptyReasonOverride: emptyReason
+                )
+            }
+            return
+        }
+
+        await runDiscovery(
+            requestKey: requestKey,
+            type: type,
+            videoId: videoId,
+            config: config,
+            addonManifestURLs: config.addonManifestURLs,
+            jellyfinTargets: jellyfinTargets,
+            token: token
+        )
+    }
+
+    private func runDiscovery(
+        requestKey: String,
+        type: String,
+        videoId: String,
+        config: CacheConfiguration,
+        addonManifestURLs: [URL],
+        jellyfinTargets: [JellyfinStreamTarget],
+        token: UUID
+    ) async {
+        guard !Task.isCancelled, isJobActive(requestKey: requestKey, token: token) else { return }
         let plexTracks = await plexTracks(videoId: videoId)
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, isJobActive(requestKey: requestKey, token: token) else { return }
         let ownedGroups = [localStreamGroup(videoId: videoId), plexStreamGroup(videoId: videoId, tracks: plexTracks)]
             .compactMap { $0 }
-        state = StreamsDiscoveryState(
-            requestKey: requestKey,
-            revision: state.revision &+ 1,
+        publishForJob(
             groups: ownedGroups,
-            isAnyLoading: true
+            requestKey: requestKey,
+            config: config,
+            token: token,
+            forceLoading: true,
+            hasResolvedTargets: false
         )
 
         let enabledURLs = addonManifestURLs
@@ -436,17 +881,18 @@ final class StreamsRepository: ObservableObject {
         // Plugin scrapers run beside the add-ons, one group each (Android parity); an AniList
         // title is asked by its IMDb id, as add-ons that don't take anilist: ids are.
         let pluginVideoId = await Self.pluginVideoId(for: videoId)
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, isJobActive(requestKey: requestKey, token: token) else { return }
         let pluginTargets = PluginStreamDiscovery.targets(type: type, videoID: pluginVideoId)
 
         guard !enabledURLs.isEmpty || !pluginTargets.isEmpty || !jellyfinTargets.isEmpty || startingAIO else {
-            state = StreamsDiscoveryState(
-                requestKey: requestKey,
-                revision: state.revision &+ 1,
+            publishForJob(
                 groups: ownedGroups,
-                isAnyLoading: false,
-                emptyStateReason: ownedGroups.isEmpty ? .noAddonsConfigured : nil,
-                hasResolvedTargets: true
+                requestKey: requestKey,
+                config: config,
+                token: token,
+                forceLoading: false,
+                hasResolvedTargets: true,
+                emptyReasonOverride: ownedGroups.isEmpty ? .noAddonsConfigured : nil
             )
             return
         }
@@ -456,7 +902,7 @@ final class StreamsRepository: ObservableObject {
         if !enabledURLs.isEmpty {
             manifestsByURL = await Self.loadManifestsConcurrently(urls: enabledURLs)
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, isJobActive(requestKey: requestKey, token: token) else { return }
 
         // An AniList title: add-ons that don't take anilist: ids are asked by Kitsu or IMDb.
         let alternatives = await Self.aniListAlternatives(
@@ -464,7 +910,7 @@ final class StreamsRepository: ObservableObject {
         // The AIOStreams addon may be asked by the converted id as well.
         let aioAlternatives = await Self.aioAlternatives(
             for: videoId, have: alternatives, aioPresent: enabledURLs.contains(where: AIOStreamsHost.isAIOAddon))
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, isJobActive(requestKey: requestKey, token: token) else { return }
 
         // Preserve configured order; only include stream-capable, id-compatible add-ons.
         var targets: [StreamAddonTarget] = []
@@ -498,13 +944,14 @@ final class StreamsRepository: ObservableObject {
         }
 
         guard !targets.isEmpty || !pluginTargets.isEmpty || !jellyfinTargets.isEmpty || startingAIO else {
-            state = StreamsDiscoveryState(
-                requestKey: requestKey,
-                revision: state.revision &+ 1,
+            publishForJob(
                 groups: ownedGroups,
-                isAnyLoading: false,
-                emptyStateReason: ownedGroups.isEmpty ? .noCompatibleAddons : nil,
-                hasResolvedTargets: true
+                requestKey: requestKey,
+                config: config,
+                token: token,
+                forceLoading: false,
+                hasResolvedTargets: true,
+                emptyReasonOverride: ownedGroups.isEmpty ? .noCompatibleAddons : nil
             )
             return
         }
@@ -531,12 +978,12 @@ final class StreamsRepository: ObservableObject {
         } + (startingAIO
             ? [AddonStreamGroup(addonId: Self.startingAIOGroupID, displayName: "AIOStreams", streams: [], isLoading: true, error: nil)]
             : [])
-        state = StreamsDiscoveryState(
-            requestKey: requestKey,
-            revision: state.revision &+ 1,
+        publishForJob(
             groups: initialGroups,
-            isAnyLoading: true,
-            emptyStateReason: nil,
+            requestKey: requestKey,
+            config: config,
+            token: token,
+            forceLoading: true,
             hasResolvedTargets: true
         )
 
@@ -550,14 +997,14 @@ final class StreamsRepository: ObservableObject {
             for target in targets {
                 group.addTask { [weak self] in
                     await Self.fetchAddonGroup(target: target, type: type, videoId: videoId) { [weak self] partial in
-                        await self?.applyPartial(partial, requestKey: requestKey)
+                        await self?.applyPartial(partial, requestKey: requestKey, config: config, token: token)
                     }
                 }
             }
             if startingAIO {
                 group.addTask { [weak self] in
                     await Self.fetchStartingAIOGroup(type: type, videoId: videoId) { [weak self] partial in
-                        await self?.applyPartial(partial, requestKey: requestKey)
+                        await self?.applyPartial(partial, requestKey: requestKey, config: config, token: token)
                     }
                 }
             }
@@ -568,7 +1015,7 @@ final class StreamsRepository: ObservableObject {
                         type: type,
                         videoID: pluginVideoId,
                         onPartial: { [weak self] partial in
-                            await self?.applyPartial(partial, requestKey: requestKey)
+                            await self?.applyPartial(partial, requestKey: requestKey, config: config, token: token)
                         }
                     )
                     return GroupUpdate(addonId: target.groupID, group: result)
@@ -577,24 +1024,30 @@ final class StreamsRepository: ObservableObject {
 
             for await update in group {
                 guard !Task.isCancelled else { break }
-                guard self.activeRequestKey == requestKey else { break }
+                guard self.isJobActive(requestKey: requestKey, token: token) else { break }
                 // Keep isAnyLoading true for the whole stream phase so the last
                 // group completing cannot drop observers before external subtitles.
-                apply(update: update, requestKey: requestKey, forceLoading: true)
+                apply(update: update, requestKey: requestKey, config: config, token: token, forceLoading: true)
             }
         }
 
-        guard !Task.isCancelled, activeRequestKey == requestKey else { return }
+        guard !Task.isCancelled, isJobActive(requestKey: requestKey, token: token) else { return }
 
         // Stream groups are done, but smart subtitle matching must not run until
         // external subtitle decoration finishes. Stay "loading" through that step.
-        publish(groups: state.groups, requestKey: requestKey, forceLoading: true)
+        publishForJob(
+            groups: currentGroups(forKey: requestKey),
+            requestKey: requestKey,
+            config: config,
+            token: token,
+            forceLoading: true
+        )
 
         let externalSubtitles = await fetchExternalSubtitles(
             type: type, videoId: videoId, manifestURLs: enabledURLs)
-        guard !Task.isCancelled, activeRequestKey == requestKey else { return }
+        guard !Task.isCancelled, isJobActive(requestKey: requestKey, token: token) else { return }
 
-        var finalGroups = state.groups
+        var finalGroups = currentGroups(forKey: requestKey)
         if !externalSubtitles.isEmpty {
             finalGroups = finalGroups.map { group in
                 var copy = group
@@ -602,48 +1055,58 @@ final class StreamsRepository: ObservableObject {
                 return copy
             }
         }
-        publish(groups: finalGroups, requestKey: requestKey, forceLoading: false)
+        publishForJob(
+            groups: finalGroups,
+            requestKey: requestKey,
+            config: config,
+            token: token,
+            forceLoading: false
+        )
+        let latestEmptyReason = discoveryCache[requestKey]?.state.emptyStateReason
         print(
-            "[StreamsRepo] done key=\(requestKey) groups=\(finalGroups.count) streams=\(finalGroups.flatMap(\.streams).count) empty=\(String(describing: state.emptyStateReason)) subtitles=\(externalSubtitles.count)"
+            "[StreamsRepo] done key=\(requestKey) groups=\(finalGroups.count) streams=\(finalGroups.flatMap(\.streams).count) empty=\(String(describing: latestEmptyReason)) subtitles=\(externalSubtitles.count)"
         )
     }
 
     /// Streams a group got while it still searches — a plugin's, or the first
     /// of the AIOStreams addon's two answers; ignored once the
     /// group has finished (the final list wins).
-    private func applyPartial(_ partial: AddonStreamGroup, requestKey: String) {
-        guard activeRequestKey == requestKey,
-              state.requestKey == requestKey,
-              let index = state.groups.firstIndex(where: { $0.addonId == partial.addonId }),
-              state.groups[index].isLoading else { return }
-        var groups = state.groups
+    private func applyPartial(
+        _ partial: AddonStreamGroup,
+        requestKey: String,
+        config: CacheConfiguration,
+        token: UUID
+    ) {
+        guard isJobActive(requestKey: requestKey, token: token) else { return }
+        var groups = currentGroups(forKey: requestKey)
+        guard let index = groups.firstIndex(where: { $0.addonId == partial.addonId }),
+              groups[index].isLoading else { return }
         groups[index] = partial
-        publish(groups: groups, requestKey: requestKey, forceLoading: true)
+        publishForJob(
+            groups: groups,
+            requestKey: requestKey,
+            config: config,
+            token: token,
+            forceLoading: true
+        )
     }
 
-    private func apply(update: GroupUpdate, requestKey: String, forceLoading: Bool) {
-        var groups = state.groups
+    private func apply(
+        update: GroupUpdate,
+        requestKey: String,
+        config: CacheConfiguration,
+        token: UUID,
+        forceLoading: Bool
+    ) {
+        var groups = currentGroups(forKey: requestKey)
         guard let index = groups.firstIndex(where: { $0.addonId == update.addonId }) else { return }
         groups[index] = update.group
-        publish(groups: groups, requestKey: requestKey, forceLoading: forceLoading)
-    }
-
-    private func publish(groups: [AddonStreamGroup], requestKey: String, forceLoading: Bool) {
-        let groupLoading = groups.contains(where: \.isLoading)
-        let anyLoading = forceLoading || groupLoading
-        let emptyReason: StreamsEmptyStateReason? = {
-            if anyLoading { return nil }
-            if groups.contains(where: { !$0.streams.isEmpty }) { return nil }
-            if groups.isEmpty { return .noCompatibleAddons }
-            return .noStreamsFound
-        }()
-        state = StreamsDiscoveryState(
-            requestKey: requestKey,
-            revision: state.revision &+ 1,
+        publishForJob(
             groups: groups,
-            isAnyLoading: anyLoading,
-            emptyStateReason: emptyReason,
-            hasResolvedTargets: true
+            requestKey: requestKey,
+            config: config,
+            token: token,
+            forceLoading: forceLoading
         )
     }
 

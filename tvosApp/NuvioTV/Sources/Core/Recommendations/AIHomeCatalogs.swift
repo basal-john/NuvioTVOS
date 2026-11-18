@@ -271,6 +271,7 @@ final class AIHomeCatalogStore: ObservableObject {
     /// Changes whenever Home should redraw the For You rows.
     @Published private(set) var revision = 0
     private var loadedProfileID: String?
+    private var hasLoadedProfile = false
     /// Bumped when what a running build was for no longer holds (rows or the
     /// AI turned off, settings changed, another profile). A build only saves
     /// its rows if the generation it started with is still current.
@@ -376,10 +377,14 @@ final class AIHomeCatalogStore: ObservableObject {
 
     private func reloadIfProfileChanged() {
         let profileID = ProfileSettings.activeProfileID
-        guard loadedProfileID != profileID || (cache == nil && loadedProfileID == nil) else { return }
-        if loadedProfileID != profileID { invalidateRunningBuild() }
+        guard !hasLoadedProfile || loadedProfileID != profileID else { return }
+        if hasLoadedProfile && loadedProfileID != profileID { invalidateRunningBuild() }
+        hasLoadedProfile = true
         loadedProfileID = profileID
-        cache = AIHomeCatalogs.loadCache()
+        let loaded = AIHomeCatalogs.loadCache()
+        if cache != nil || loaded != nil {
+            cache = loaded
+        }
     }
 
     private func invalidateRunningBuild() {

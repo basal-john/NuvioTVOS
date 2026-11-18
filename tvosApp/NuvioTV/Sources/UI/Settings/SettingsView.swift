@@ -11741,7 +11741,6 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @AppStorage(SettingsKey.postPlayRecommendationsEnabled) private var postPlayRecommendationsEnabled = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
-    @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = false
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.trailerSound) private var trailerSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
@@ -12378,15 +12377,6 @@ private struct PlaybackSettingsView: View {
                 )
 
                 SettingsToggleRow(
-                    title: L10n.string("tvos_settings_background_trailers", fallback: "Background Trailers"),
-                    subtitle: L10n.string("tvos_settings_background_trailers_subtitle", fallback: "Play automatic trailers in the background on detail pages"),
-                    isOn: $backgroundTrailersEnabled,
-                    accentColor: accentColor
-                )
-                .opacity(trailersEnabled ? 1 : 0.46)
-                .disabled(!trailersEnabled)
-
-                SettingsToggleRow(
                     title: L10n.string("tvos_settings_card_trailer_sound", fallback: "Card Trailer Sound"),
                     subtitle: L10n.string("tvos_settings_play_sound_for_focused_card_trailers", fallback: "Play sound for focused-card trailers"),
                     isOn: $trailerPreviewSound,
@@ -12399,7 +12389,7 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_trailer_sound", fallback: "Trailer Sound"),
                     subtitle: L10n.string(
                         "tvos_settings_trailer_sound_description",
-                        fallback: "Play sound for Details background trailers, post-play trailers, and the Grid hero carousel."
+                        fallback: "Play sound for post-play trailers and the Grid hero carousel."
                     ),
                     isOn: Binding(
                         get: { trailerSound },

@@ -364,7 +364,7 @@ struct CollectionSourceResolver {
             description: nonEmpty(item.overview),
             posterUrl: tmdbImage(item.posterPath, size: "w500")
                 ?? tmdbImage(item.backdropPath, size: "w780"),
-            backgroundUrl: tmdbImage(item.backdropPath, size: "w1280"),
+            backgroundUrl: tmdbImage(item.backdropPath, size: "original"),
             logoUrl: nil,
             imdbId: nil,
             tmdbId: item.id,
