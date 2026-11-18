@@ -902,7 +902,7 @@ class DetailsViewModel: ObservableObject {
         } else {
             print("[PreFetch] 🚀 Started background stream pre-fetch for \"\(meta.name)\" (streamId: \(targetStreamId))")
         }
-        prepareStreams(forId: targetStreamId, type: contentType)
+        prepareStreams(forId: targetStreamId, type: contentType, revalidateIfCached: true)
     }
 
     /// Re-syncs the view model's foreground stream state to the current default
@@ -1356,7 +1356,14 @@ class DetailsViewModel: ObservableObject {
     ///   cancel the shared search
     ///
     /// `forceRefresh` restarts discovery for the same key (explicit refresh).
-    func prepareStreams(forId streamId: String, type: String, forceRefresh: Bool = false) {
+    /// `revalidateIfCached` serves a cached result instantly and refreshes it in
+    /// the background once it is past the repository's revalidation cooldown.
+    func prepareStreams(
+        forId streamId: String,
+        type: String,
+        forceRefresh: Bool = false,
+        revalidateIfCached: Bool = false
+    ) {
         streamObserveTask?.cancel()
 
         let targetId: String = {
@@ -1377,13 +1384,23 @@ class DetailsViewModel: ObservableObject {
         requestedStreamId = targetId
 
         if streamDiscoveryMode == .shared {
-            prepareSharedStreams(forId: targetId, type: type, forceRefresh: forceRefresh)
+            prepareSharedStreams(
+                forId: targetId,
+                type: type,
+                forceRefresh: forceRefresh,
+                revalidateIfCached: revalidateIfCached
+            )
         } else {
             prepareRepositoryStreams(forId: targetId, type: type)
         }
     }
 
-    private func prepareSharedStreams(forId streamId: String, type: String, forceRefresh: Bool) {
+    private func prepareSharedStreams(
+        forId streamId: String,
+        type: String,
+        forceRefresh: Bool,
+        revalidateIfCached: Bool
+    ) {
         let se = StreamsRepository.seasonEpisode(fromVideoId: streamId)
         let key = StreamsRepository.requestKey(
             type: type,
@@ -1400,7 +1417,8 @@ class DetailsViewModel: ObservableObject {
             videoId: streamId,
             season: se.season,
             episode: se.episode,
-            forceRefresh: forceRefresh
+            forceRefresh: forceRefresh,
+            revalidateIfCached: revalidateIfCached
         )
 
         // Seed UI from cache immediately (return-from-playback reuse).
@@ -1426,7 +1444,8 @@ class DetailsViewModel: ObservableObject {
                 if snapshot.requestKey == key || (snapshot.requestKey == nil && snapshot.groups.isEmpty) {
                     self.applyDiscoveryState(snapshot, expectedKey: key)
                 }
-                if snapshot.requestKey == key, snapshot.hasResolvedTargets, !snapshot.isAnyLoading {
+                if snapshot.requestKey == key, snapshot.hasResolvedTargets, !snapshot.isAnyLoading,
+                   !self.streamsRepository.isRevalidating(requestKey: key) {
                     break
                 }
                 // Another key replaced ours after we finished applying cache —

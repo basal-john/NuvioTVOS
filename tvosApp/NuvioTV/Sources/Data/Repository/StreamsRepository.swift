@@ -27,6 +27,13 @@ final class StreamsRepository: ObservableObject {
     /// Maximum number of title/episode discovery snapshots held in the LRU cache.
     nonisolated static let defaultMaxCacheEntries: Int = 8
 
+    /// Minimum age (seconds) of a completed cached result before a Details open
+    /// revalidates it in the background (stale-while-revalidate cooldown).
+    nonisolated static let defaultMinimumRevalidateAge: TimeInterval = 15
+
+    /// Group ids of streams built from local indexes (SMB, Plex), not add-ons.
+    nonisolated static let ownedGroupIdPrefix = "local."
+
     /// Shared URLSession used for Jellyfin `PlaybackInfo` requests; overridable in tests.
     nonisolated(unsafe) static var jellyfinSession: URLSession = .shared
 
@@ -40,6 +47,9 @@ final class StreamsRepository: ObservableObject {
         var config: CacheConfiguration
         var updatedAt: Date
         var lastAccessedAt: Date
+        /// Last completed background revalidation, including one whose result was
+        /// discarded to keep cached streams. Drives the revalidation cooldown.
+        var lastRevalidatedAt: Date?
     }
 
     typealias DiscoveryPublisher = @MainActor (
@@ -73,9 +83,18 @@ final class StreamsRepository: ObservableObject {
     private var backgroundPrefetchKey: String?
     private var backgroundPrefetchConfig: CacheConfiguration?
 
+    private var revalidationJob: Task<Void, Never>?
+    private var revalidationToken: UUID?
+    private var revalidationKey: String?
+    private var revalidationConfig: CacheConfiguration?
+    /// Staging buffer for a background revalidation. Never visible through
+    /// `state` or `discoveryCache` until the refreshed result is complete.
+    private var revalidationBuffer: StreamsDiscoveryState?
+
     private var discoveryCache: [String: CachedDiscoveryEntry] = [:]
     private let maxCacheEntries: Int
     private let cacheTTL: TimeInterval
+    private let minimumRevalidateAge: TimeInterval
     private let nowProvider: () -> Date
     private let configuredAddonsProvider: () -> [URL]
     private let customDiscoveryHandler: DiscoveryHandler?
@@ -86,12 +105,14 @@ final class StreamsRepository: ObservableObject {
     private init(
         maxCacheEntries: Int = StreamsRepository.defaultMaxCacheEntries,
         cacheTTL: TimeInterval = StreamsRepository.defaultCacheTTL,
+        minimumRevalidateAge: TimeInterval = StreamsRepository.defaultMinimumRevalidateAge,
         nowProvider: @escaping () -> Date = Date.init,
         configuredAddonsProvider: @escaping () -> [URL] = { CinemetaCatalogRepository.configuredStreamAddonManifestURLs },
         discoveryHandler: DiscoveryHandler? = nil
     ) {
         self.maxCacheEntries = max(1, maxCacheEntries)
         self.cacheTTL = cacheTTL
+        self.minimumRevalidateAge = minimumRevalidateAge
         self.nowProvider = nowProvider
         self.configuredAddonsProvider = configuredAddonsProvider
         self.customDiscoveryHandler = discoveryHandler
@@ -100,6 +121,7 @@ final class StreamsRepository: ObservableObject {
     static func makeForTesting(
         maxCacheEntries: Int = defaultMaxCacheEntries,
         cacheTTL: TimeInterval = defaultCacheTTL,
+        minimumRevalidateAge: TimeInterval = defaultMinimumRevalidateAge,
         nowProvider: @escaping () -> Date = Date.init,
         configuredAddonsProvider: @escaping () -> [URL] = { [] },
         discoveryHandler: DiscoveryHandler? = nil
@@ -107,6 +129,7 @@ final class StreamsRepository: ObservableObject {
         StreamsRepository(
             maxCacheEntries: maxCacheEntries,
             cacheTTL: cacheTTL,
+            minimumRevalidateAge: minimumRevalidateAge,
             nowProvider: nowProvider,
             configuredAddonsProvider: configuredAddonsProvider,
             discoveryHandler: discoveryHandler
@@ -117,7 +140,8 @@ final class StreamsRepository: ObservableObject {
         forType type: String,
         videoId: String,
         season: Int? = nil,
-        episode: Int? = nil
+        episode: Int? = nil,
+        includeCompletedEmpty: Bool = false
     ) -> StreamsDiscoveryState? {
         let se = (season == nil && episode == nil)
             ? Self.seasonEpisode(fromVideoId: videoId)
@@ -131,7 +155,21 @@ final class StreamsRepository: ObservableObject {
         if !entry.state.isAnyLoading && nowProvider().timeIntervalSince(entry.updatedAt) >= cacheTTL {
             return nil
         }
+        if !includeCompletedEmpty, Self.isCompletedEmpty(entry.state) {
+            return nil
+        }
         return entry.state
+    }
+
+    /// Whether a background stale-while-revalidate refresh is running for `requestKey`.
+    func isRevalidating(requestKey: String) -> Bool {
+        revalidationKey == requestKey && revalidationJob != nil
+    }
+
+    /// A finished discovery with zero streams. Never reused across navigations,
+    /// so a source added later (Debrid, AIOStreams, Jellyfin/Plex) is not missed.
+    private static func isCompletedEmpty(_ snapshot: StreamsDiscoveryState) -> Bool {
+        !snapshot.isAnyLoading && snapshot.allStreams.isEmpty
     }
 
     var cachedKeysInOrderForTesting: [String] {
@@ -146,6 +184,7 @@ final class StreamsRepository: ObservableObject {
         backgroundPrefetchToken = nil
         backgroundPrefetchKey = nil
         backgroundPrefetchConfig = nil
+        cancelRevalidation()
         discoveryCache.removeAll()
     }
 
@@ -373,7 +412,8 @@ final class StreamsRepository: ObservableObject {
         videoId: String,
         season: Int? = nil,
         episode: Int? = nil,
-        forceRefresh: Bool = false
+        forceRefresh: Bool = false,
+        revalidateIfCached: Bool = false
     ) {
         let se = (season == nil && episode == nil)
             ? Self.seasonEpisode(fromVideoId: videoId)
@@ -388,6 +428,17 @@ final class StreamsRepository: ObservableObject {
         )
         let current = state
         let now = nowProvider()
+        let revalidateIfStale = {
+            guard revalidateIfCached else { return }
+            self.startRevalidationIfStale(
+                key: key,
+                type: type,
+                videoId: videoId,
+                config: currentConfig,
+                jellyfinTargets: currentJellyfinTargets,
+                now: now
+            )
+        }
 
         if !forceRefresh,
            Self.requestConfigurationMatches(
@@ -408,6 +459,9 @@ final class StreamsRepository: ObservableObject {
                     discoveryCache[key] = entry
                 }
                 print("[StreamsRepo] skip reload key=\(key) groups=\(current.groups.count) loading=\(current.isAnyLoading)")
+                if !current.isAnyLoading {
+                    revalidateIfStale()
+                }
                 return
             }
         }
@@ -459,6 +513,7 @@ final class StreamsRepository: ObservableObject {
            var cachedEntry = discoveryCache[key],
            cachedEntry.config == currentConfig,
            !cachedEntry.state.isAnyLoading,
+           !Self.isCompletedEmpty(cachedEntry.state),
            now.timeIntervalSince(cachedEntry.updatedAt) < cacheTTL {
             activeJob?.cancel()
             activeJob = nil
@@ -479,10 +534,14 @@ final class StreamsRepository: ObservableObject {
                 hasResolvedTargets: cachedEntry.state.hasResolvedTargets
             )
             print("[StreamsRepo] LRU cache hit key=\(key) groups=\(cachedEntry.state.groups.count) streams=\(cachedEntry.state.allStreams.count)")
+            revalidateIfStale()
             return
         }
 
         // Case D: Cache miss or explicit forceRefresh.
+        if revalidationKey == key {
+            cancelRevalidation()
+        }
         if forceRefresh, backgroundPrefetchKey == key {
             backgroundPrefetchJob?.cancel()
             backgroundPrefetchJob = nil
@@ -564,9 +623,21 @@ final class StreamsRepository: ObservableObject {
         if var entry = discoveryCache[key],
            entry.config == currentConfig,
            !entry.state.isAnyLoading,
+           !Self.isCompletedEmpty(entry.state),
            now.timeIntervalSince(entry.updatedAt) < cacheTTL {
             entry.lastAccessedAt = now
             discoveryCache[key] = entry
+            return
+        }
+
+        if let entry = discoveryCache[key],
+           entry.config == currentConfig,
+           Self.isCompletedEmpty(entry.state),
+           now.timeIntervalSince(entry.updatedAt) < minimumRevalidateAge {
+            return
+        }
+
+        if isRevalidating(requestKey: key), revalidationConfig == currentConfig {
             return
         }
 
@@ -720,7 +791,11 @@ final class StreamsRepository: ObservableObject {
     private func isJobActive(requestKey: String, token: UUID) -> Bool {
         let isForeground = (activeJobToken == token && activeRequestKey == requestKey)
         let isBackground = (backgroundPrefetchToken == token && backgroundPrefetchKey == requestKey)
-        return isForeground || isBackground
+        return isForeground || isBackground || isRevalidationJob(requestKey: requestKey, token: token)
+    }
+
+    private func isRevalidationJob(requestKey: String, token: UUID) -> Bool {
+        revalidationToken == token && revalidationKey == requestKey
     }
 
     private func finishJob(requestKey: String, token: UUID) {
@@ -734,25 +809,184 @@ final class StreamsRepository: ObservableObject {
             backgroundPrefetchKey = nil
             backgroundPrefetchConfig = nil
         }
+        if isRevalidationJob(requestKey: requestKey, token: token) {
+            revalidationToken = nil
+            revalidationJob = nil
+            revalidationKey = nil
+            revalidationConfig = nil
+            revalidationBuffer = nil
+        }
+    }
+
+    private func cancelRevalidation() {
+        revalidationJob?.cancel()
+        revalidationJob = nil
+        revalidationToken = nil
+        revalidationKey = nil
+        revalidationConfig = nil
+        revalidationBuffer = nil
+    }
+
+    /// Stale-while-revalidate: re-runs discovery for a completed cached key in a
+    /// staging buffer once it is older than `minimumRevalidateAge`. Foreground
+    /// `state` and the cache entry keep serving the cached streams until the
+    /// refreshed result is complete.
+    private func startRevalidationIfStale(
+        key: String,
+        type: String,
+        videoId: String,
+        config: CacheConfiguration,
+        jellyfinTargets: [JellyfinStreamTarget],
+        now: Date
+    ) {
+        guard let entry = discoveryCache[key],
+              entry.config == config,
+              !entry.state.isAnyLoading else { return }
+        let lastRefreshed = max(entry.updatedAt, entry.lastRevalidatedAt ?? .distantPast)
+        guard now.timeIntervalSince(lastRefreshed) >= minimumRevalidateAge else { return }
+        guard !isRevalidating(requestKey: key) else { return }
+
+        cancelRevalidation()
+        var attempted = entry
+        attempted.lastRevalidatedAt = now
+        discoveryCache[key] = attempted
+
+        let jobToken = UUID()
+        revalidationToken = jobToken
+        revalidationKey = key
+        revalidationConfig = config
+        revalidationBuffer = StreamsDiscoveryState(
+            requestKey: key,
+            revision: entry.state.revision,
+            groups: [],
+            isAnyLoading: true,
+            hasResolvedTargets: false
+        )
+        print("[StreamsRepo] revalidating key=\(key) age=\(Int(now.timeIntervalSince(entry.updatedAt)))s")
+        revalidationJob = Task { [weak self] in
+            guard let self else { return }
+            await self.executeDiscovery(
+                requestKey: key,
+                type: type,
+                videoId: videoId,
+                config: config,
+                jellyfinTargets: jellyfinTargets,
+                token: jobToken
+            )
+        }
+    }
+
+    /// Stages a revalidation snapshot and publishes it atomically once complete.
+    ///
+    /// Populated streams are never replaced by 0 streams caused by a failure: an
+    /// add-on that errored, or is missing from this run (its manifest failed),
+    /// keeps the streams it had. A clean empty answer clears them. Local SMB/Plex
+    /// groups are rebuilt from the index and are not carried. Carried-forward
+    /// streams keep the entry's original `updatedAt`, so the TTL still forces a
+    /// full refetch. The commit is dropped if the entry was evicted, reconfigured,
+    /// or is being reloaded by a newer job.
+    private func stageRevalidation(
+        groups: [AddonStreamGroup],
+        requestKey: String,
+        config: CacheConfiguration,
+        anyLoading: Bool,
+        emptyReason: StreamsEmptyStateReason?,
+        hasResolvedTargets: Bool
+    ) {
+        let staged = StreamsDiscoveryState(
+            requestKey: requestKey,
+            revision: revalidationBuffer?.revision ?? 0,
+            groups: groups,
+            isAnyLoading: anyLoading,
+            emptyStateReason: emptyReason,
+            hasResolvedTargets: hasResolvedTargets
+        )
+        revalidationBuffer = staged
+        guard !anyLoading else { return }
+
+        guard let existing = discoveryCache[requestKey],
+              existing.config == config,
+              !existing.state.isAnyLoading else {
+            print("[StreamsRepo] revalidation key=\(requestKey) dropped (entry evicted, reconfigured, or owned by a newer job)")
+            return
+        }
+
+        let cachedGroups = Dictionary(
+            existing.state.groups.map { ($0.addonId, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var carriedForward = false
+        var mergedGroups = groups.map { group -> AddonStreamGroup in
+            guard group.error != nil, group.streams.isEmpty,
+                  let cached = cachedGroups[group.addonId], !cached.streams.isEmpty else { return group }
+            carriedForward = true
+            return cached
+        }
+        let refreshedIds = Set(groups.map(\.addonId))
+        for cached in existing.state.groups
+        where !refreshedIds.contains(cached.addonId)
+            && !cached.addonId.hasPrefix(Self.ownedGroupIdPrefix)
+            && !cached.streams.isEmpty {
+            carriedForward = true
+            mergedGroups.append(cached)
+        }
+        let mergedHasStreams = mergedGroups.contains { !$0.streams.isEmpty }
+
+        let mergedEmptyReason = mergedHasStreams ? nil : emptyReason
+        let committed = StreamsDiscoveryState(
+            requestKey: requestKey,
+            revision: existing.state.revision &+ 1,
+            groups: mergedGroups,
+            isAnyLoading: false,
+            emptyStateReason: mergedEmptyReason,
+            hasResolvedTargets: hasResolvedTargets
+        )
+        recordCacheSnapshot(
+            committed,
+            key: requestKey,
+            config: config,
+            updatedAt: carriedForward ? existing.updatedAt : nil
+        )
+        discoveryCache[requestKey]?.lastRevalidatedAt = nowProvider()
+
+        if activeRequestKey == requestKey,
+           activeJobToken == nil,
+           activeAddonManifestURLs == config.addonManifestURLs {
+            state = StreamsDiscoveryState(
+                requestKey: requestKey,
+                revision: state.revision &+ 1,
+                groups: mergedGroups,
+                isAnyLoading: false,
+                emptyStateReason: mergedEmptyReason,
+                hasResolvedTargets: hasResolvedTargets
+            )
+        } else {
+            backgroundCacheRevision &+= 1
+        }
+        print("[StreamsRepo] revalidated key=\(requestKey) streams=\(committed.allStreams.count)")
     }
 
     private func recordCacheSnapshot(
         _ snapshot: StreamsDiscoveryState,
         key: String,
-        config: CacheConfiguration
+        config: CacheConfiguration,
+        updatedAt: Date? = nil
     ) {
         let now = nowProvider()
         discoveryCache[key] = CachedDiscoveryEntry(
             state: snapshot,
             config: config,
-            updatedAt: now,
+            updatedAt: updatedAt ?? now,
             lastAccessedAt: now
         )
         if discoveryCache.count > maxCacheEntries {
             let overflow = discoveryCache.count - maxCacheEntries
             let evictionCandidates = discoveryCache
-                .filter { $0.key != key && $0.key != activeRequestKey && $0.key != backgroundPrefetchKey }
-                .sorted { $0.value.lastAccessedAt < $1.value.lastAccessedAt }
+                .filter {
+                    $0.key != key && $0.key != activeRequestKey
+                        && $0.key != backgroundPrefetchKey && $0.key != revalidationKey
+                }
+                .sorted(by: Self.evictsBefore)
             for victim in evictionCandidates.prefix(overflow) {
                 discoveryCache.removeValue(forKey: victim.key)
             }
@@ -761,7 +995,7 @@ final class StreamsRepository: ObservableObject {
                 let extra = discoveryCache.count - maxCacheEntries
                 let remaining = discoveryCache
                     .filter { $0.key != key }
-                    .sorted { $0.value.lastAccessedAt < $1.value.lastAccessedAt }
+                    .sorted(by: Self.evictsBefore)
                 for victim in remaining.prefix(extra) {
                     discoveryCache.removeValue(forKey: victim.key)
                 }
@@ -769,8 +1003,23 @@ final class StreamsRepository: ObservableObject {
         }
     }
 
-    private func currentGroups(forKey key: String) -> [AddonStreamGroup] {
-        discoveryCache[key]?.state.groups ?? []
+    /// Eviction order: completed 0-stream entries first, so they never push a
+    /// populated title out of the LRU cache, then least recently used.
+    private static func evictsBefore(
+        _ lhs: (key: String, value: CachedDiscoveryEntry),
+        _ rhs: (key: String, value: CachedDiscoveryEntry)
+    ) -> Bool {
+        let lhsEmpty = isCompletedEmpty(lhs.value.state)
+        let rhsEmpty = isCompletedEmpty(rhs.value.state)
+        if lhsEmpty != rhsEmpty { return lhsEmpty }
+        return lhs.value.lastAccessedAt < rhs.value.lastAccessedAt
+    }
+
+    private func currentGroups(forKey key: String, token: UUID) -> [AddonStreamGroup] {
+        if isRevalidationJob(requestKey: key, token: token) {
+            return revalidationBuffer?.groups ?? []
+        }
+        return discoveryCache[key]?.state.groups ?? []
     }
 
     private func publishForJob(
@@ -791,6 +1040,17 @@ final class StreamsRepository: ObservableObject {
             if groups.isEmpty { return .noCompatibleAddons }
             return .noStreamsFound
         }()
+        if isRevalidationJob(requestKey: requestKey, token: token) {
+            stageRevalidation(
+                groups: groups,
+                requestKey: requestKey,
+                config: config,
+                anyLoading: anyLoading,
+                emptyReason: emptyReason,
+                hasResolvedTargets: hasResolvedTargets
+            )
+            return
+        }
         let existingRevision = discoveryCache[requestKey]?.state.revision ?? 0
         let cachedSnapshot = StreamsDiscoveryState(
             requestKey: requestKey,
@@ -1036,7 +1296,7 @@ final class StreamsRepository: ObservableObject {
         // Stream groups are done, but smart subtitle matching must not run until
         // external subtitle decoration finishes. Stay "loading" through that step.
         publishForJob(
-            groups: currentGroups(forKey: requestKey),
+            groups: currentGroups(forKey: requestKey, token: token),
             requestKey: requestKey,
             config: config,
             token: token,
@@ -1047,7 +1307,7 @@ final class StreamsRepository: ObservableObject {
             type: type, videoId: videoId, manifestURLs: enabledURLs)
         guard !Task.isCancelled, isJobActive(requestKey: requestKey, token: token) else { return }
 
-        var finalGroups = currentGroups(forKey: requestKey)
+        var finalGroups = currentGroups(forKey: requestKey, token: token)
         if !externalSubtitles.isEmpty {
             finalGroups = finalGroups.map { group in
                 var copy = group
@@ -1078,7 +1338,7 @@ final class StreamsRepository: ObservableObject {
         token: UUID
     ) {
         guard isJobActive(requestKey: requestKey, token: token) else { return }
-        var groups = currentGroups(forKey: requestKey)
+        var groups = currentGroups(forKey: requestKey, token: token)
         guard let index = groups.firstIndex(where: { $0.addonId == partial.addonId }),
               groups[index].isLoading else { return }
         groups[index] = partial
@@ -1098,7 +1358,7 @@ final class StreamsRepository: ObservableObject {
         token: UUID,
         forceLoading: Bool
     ) {
-        var groups = currentGroups(forKey: requestKey)
+        var groups = currentGroups(forKey: requestKey, token: token)
         guard let index = groups.firstIndex(where: { $0.addonId == update.addonId }) else { return }
         groups[index] = update.group
         publishForJob(

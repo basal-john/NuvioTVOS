@@ -182,6 +182,324 @@ final class StreamsPrefetchRepositoryTests: XCTestCase {
         XCTAssertFalse(repo.state.isAnyLoading)
         XCTAssertEqual(repo.state.allStreams.count, 2)
     }
+
+    private func streams(for videoId: String, count: Int) -> [NuvioStream] {
+        guard count > 0 else { return [] }
+        return (1...count).map {
+            NuvioStream(url: "https://cdn.example/\(videoId)-\($0).mkv", name: "1080p", description: "v\($0)", addonName: "Addon")
+        }
+    }
+
+    func testEmptyZeroStreamResultsAreNotReusedFromCachePrefetchOrCachedState() async {
+        var now = Date(timeIntervalSince1970: 10_000)
+        var calls: [String] = []
+        let repo = StreamsRepository.makeForTesting(
+            maxCacheEntries: 8,
+            cacheTTL: 300,
+            nowProvider: { now },
+            configuredAddonsProvider: { [URL(string: "https://addon.example/manifest.json")!] },
+            discoveryHandler: { _, _, videoId, _, publish in
+                calls.append(videoId)
+                publish([AddonStreamGroup(addonId: "a1", displayName: "Addon", streams: [], isLoading: false)], false, .noStreamsFound, true)
+            }
+        )
+        let emptyKey = StreamsRepository.requestKey(type: "movie", videoId: "tt0000010")
+
+        repo.load(type: "movie", videoId: "tt0000010")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, ["tt0000010"])
+        XCTAssertEqual(repo.state.requestKey, emptyKey)
+        XCTAssertEqual(repo.state.emptyStateReason, .noStreamsFound)
+
+        now = now.addingTimeInterval(5)
+        repo.load(type: "movie", videoId: "tt0000010")
+        XCTAssertEqual(calls, ["tt0000010"])
+        XCTAssertEqual(repo.state.emptyStateReason, .noStreamsFound)
+        XCTAssertFalse(repo.state.isAnyLoading)
+
+        XCTAssertNil(repo.cachedState(forType: "movie", videoId: "tt0000010"))
+
+        repo.load(type: "movie", videoId: "tt0000020")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        repo.load(type: "movie", videoId: "tt0000010")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, ["tt0000010", "tt0000020", "tt0000010"])
+
+        repo.load(type: "movie", videoId: "tt0000030")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        repo.prefetch(type: "movie", videoId: "tt0000010")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, ["tt0000010", "tt0000020", "tt0000010", "tt0000030"])
+
+        now = now.addingTimeInterval(StreamsRepository.defaultMinimumRevalidateAge + 1)
+        repo.prefetch(type: "movie", videoId: "tt0000010")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, ["tt0000010", "tt0000020", "tt0000010", "tt0000030", "tt0000010"])
+
+        XCTAssertEqual(
+            repo.cachedState(forType: "movie", videoId: "tt0000010", includeCompletedEmpty: true)?.emptyStateReason,
+            .noStreamsFound
+        )
+    }
+
+    func testEmptyEntriesAreEvictedBeforePopulatedTitles() async {
+        var clock = Date(timeIntervalSince1970: 11_000)
+        let repo = StreamsRepository.makeForTesting(
+            maxCacheEntries: 2,
+            cacheTTL: 300,
+            nowProvider: { clock },
+            configuredAddonsProvider: { [URL(string: "https://addon.example/manifest.json")!] },
+            discoveryHandler: { [unowned self] _, _, videoId, _, publish in
+                let found = videoId == "tt0000099" ? [] : self.streams(for: videoId, count: 1)
+                publish([AddonStreamGroup(addonId: "a1", displayName: "Addon", streams: found, isLoading: false)], false, nil, true)
+            }
+        )
+
+        repo.prefetch(type: "movie", videoId: "tt0000001")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        clock = clock.addingTimeInterval(1)
+        repo.prefetch(type: "movie", videoId: "tt0000099")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        clock = clock.addingTimeInterval(1)
+        repo.prefetch(type: "movie", videoId: "tt0000002")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(repo.cachedKeysInOrderForTesting.count, 2)
+        XCTAssertFalse(repo.cachedKeysInOrderForTesting.contains(StreamsRepository.requestKey(type: "movie", videoId: "tt0000099")))
+        XCTAssertNotNil(repo.cachedState(forType: "movie", videoId: "tt0000001"), "Least recently used populated title must survive an empty entry")
+        XCTAssertNotNil(repo.cachedState(forType: "movie", videoId: "tt0000002"))
+    }
+
+    func testRevalidateIfCachedServesCachedStreamsThenPublishesRefreshedStreams() async {
+        var now = Date(timeIntervalSince1970: 20_000)
+        var calls: [String] = []
+        var streamCount = 1
+        var slow = false
+        let repo = StreamsRepository.makeForTesting(
+            maxCacheEntries: 8,
+            cacheTTL: 300,
+            nowProvider: { now },
+            configuredAddonsProvider: { [URL(string: "https://addon.example/manifest.json")!] },
+            discoveryHandler: { [unowned self] _, _, videoId, _, publish in
+                calls.append(videoId)
+                let count = streamCount
+                if slow {
+                    publish([AddonStreamGroup(addonId: "a1", displayName: "Addon", streams: [], isLoading: true)], true, nil, true)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    guard !Task.isCancelled else { return }
+                }
+                publish([AddonStreamGroup(addonId: "a1", displayName: "Addon", streams: self.streams(for: videoId, count: count), isLoading: false)], false, nil, true)
+            }
+        )
+        let key = StreamsRepository.requestKey(type: "movie", videoId: "tt3000000")
+
+        repo.load(type: "movie", videoId: "tt3000000")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        repo.load(type: "movie", videoId: "tt3000001")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, ["tt3000000", "tt3000001"])
+
+        now = now.addingTimeInterval(StreamsRepository.defaultMinimumRevalidateAge + 5)
+        streamCount = 2
+        slow = true
+        repo.load(type: "movie", videoId: "tt3000000", revalidateIfCached: true)
+        let servedRevision = repo.state.revision
+
+        XCTAssertEqual(repo.state.requestKey, key)
+        XCTAssertEqual(repo.state.allStreams.count, 1, "Cached streams must be served instantly")
+        XCTAssertFalse(repo.state.isAnyLoading)
+        XCTAssertTrue(repo.isRevalidating(requestKey: key))
+
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        XCTAssertEqual(calls, ["tt3000000", "tt3000001", "tt3000000"])
+        XCTAssertEqual(repo.state.allStreams.count, 1)
+        XCTAssertFalse(repo.state.isAnyLoading)
+        XCTAssertEqual(repo.state.revision, servedRevision)
+        XCTAssertEqual(repo.cachedState(forType: "movie", videoId: "tt3000000")?.allStreams.count, 1)
+        XCTAssertEqual(repo.cachedState(forType: "movie", videoId: "tt3000000")?.isAnyLoading, false)
+
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(repo.isRevalidating(requestKey: key))
+        XCTAssertEqual(repo.state.allStreams.count, 2, "Refreshed streams must be published once revalidation completes")
+        XCTAssertGreaterThan(repo.state.revision, servedRevision)
+        XCTAssertFalse(repo.state.isAnyLoading)
+        XCTAssertEqual(repo.cachedState(forType: "movie", videoId: "tt3000000")?.allStreams.count, 2)
+    }
+
+    func testRevalidationKeepsCachedStreamsWhenRefreshErrorsWithZeroStreams() async {
+        var now = Date(timeIntervalSince1970: 30_000)
+        var failing = false
+        var calls = 0
+        let repo = StreamsRepository.makeForTesting(
+            maxCacheEntries: 8,
+            cacheTTL: 300,
+            nowProvider: { now },
+            configuredAddonsProvider: { [URL(string: "https://addon.example/manifest.json")!] },
+            discoveryHandler: { [unowned self] _, _, videoId, _, publish in
+                calls += 1
+                let group = failing
+                    ? AddonStreamGroup(addonId: "a1", displayName: "Addon", streams: [], isLoading: false, error: "timeout")
+                    : AddonStreamGroup(addonId: "a1", displayName: "Addon", streams: self.streams(for: videoId, count: 1), isLoading: false)
+                publish([group], false, nil, true)
+            }
+        )
+
+        repo.load(type: "movie", videoId: "tt4000000")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        now = now.addingTimeInterval(StreamsRepository.defaultMinimumRevalidateAge + 1)
+        failing = true
+        repo.load(type: "movie", videoId: "tt4000000", revalidateIfCached: true)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertFalse(repo.isRevalidating(requestKey: StreamsRepository.requestKey(type: "movie", videoId: "tt4000000")))
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(repo.state.allStreams.count, 1)
+        XCTAssertEqual(repo.cachedState(forType: "movie", videoId: "tt4000000")?.allStreams.count, 1)
+
+        now = now.addingTimeInterval(5)
+        repo.load(type: "movie", videoId: "tt4000000", revalidateIfCached: true)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, 2)
+    }
+
+    func testRevalidationCarriesForwardStreamsOfAnAddonThatFailedThisTime() async {
+        var now = Date(timeIntervalSince1970: 35_000)
+        var refresh = false
+        let repo = StreamsRepository.makeForTesting(
+            maxCacheEntries: 8,
+            cacheTTL: 300,
+            nowProvider: { now },
+            configuredAddonsProvider: { [URL(string: "https://addon.example/manifest.json")!] },
+            discoveryHandler: { [unowned self] _, _, videoId, _, publish in
+                let debrid = refresh
+                    ? AddonStreamGroup(addonId: "debrid", displayName: "Debrid", streams: [], isLoading: false, error: "Timed out")
+                    : AddonStreamGroup(addonId: "debrid", displayName: "Debrid", streams: self.streams(for: "\(videoId)-d", count: 3), isLoading: false)
+                let aio = AddonStreamGroup(
+                    addonId: "aio",
+                    displayName: "AIOStreams",
+                    streams: self.streams(for: "\(videoId)-a", count: refresh ? 2 : 1),
+                    isLoading: false
+                )
+                publish([debrid, aio], false, nil, true)
+            }
+        )
+
+        repo.load(type: "movie", videoId: "tt4500000")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(repo.state.allStreams.count, 4)
+
+        now = now.addingTimeInterval(StreamsRepository.defaultMinimumRevalidateAge + 1)
+        refresh = true
+        repo.load(type: "movie", videoId: "tt4500000", revalidateIfCached: true)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(repo.state.groups.first { $0.addonId == "debrid" }?.streams.count, 3, "A timed-out add-on keeps its cached streams")
+        XCTAssertEqual(repo.state.groups.first { $0.addonId == "aio" }?.streams.count, 2, "Healthy add-ons publish their refreshed streams")
+        XCTAssertEqual(repo.state.allStreams.count, 5)
+    }
+
+    func testRevalidationCarriesMissingAddonsButNotLocalGroupsAndCleanEmptyClears() async {
+        var now = Date(timeIntervalSince1970: 37_000)
+        var phase = 0
+        var calls = 0
+        let repo = StreamsRepository.makeForTesting(
+            maxCacheEntries: 8,
+            cacheTTL: 300,
+            nowProvider: { now },
+            configuredAddonsProvider: { [URL(string: "https://addon.example/manifest.json")!] },
+            discoveryHandler: { [unowned self] _, _, videoId, _, publish in
+                calls += 1
+                let local = AddonStreamGroup(addonId: "local.smb", displayName: "SMB", streams: self.streams(for: "\(videoId)-l", count: 1), isLoading: false)
+                let debrid = AddonStreamGroup(addonId: "debrid", displayName: "Debrid", streams: self.streams(for: "\(videoId)-d", count: 2), isLoading: false)
+                let aio = AddonStreamGroup(addonId: "aio", displayName: "AIOStreams", streams: self.streams(for: "\(videoId)-a", count: 1), isLoading: false)
+                switch phase {
+                case 0:
+                    publish([local, debrid, aio], false, nil, true)
+                case 1:
+                    publish([aio], false, nil, true)
+                default:
+                    publish([AddonStreamGroup(addonId: "aio", displayName: "AIOStreams", streams: [], isLoading: false)], false, .noStreamsFound, true)
+                }
+            }
+        )
+        let key = StreamsRepository.requestKey(type: "movie", videoId: "tt4700000")
+
+        repo.load(type: "movie", videoId: "tt4700000")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(repo.state.allStreams.count, 4)
+
+        now = now.addingTimeInterval(StreamsRepository.defaultMinimumRevalidateAge + 1)
+        phase = 1
+        repo.load(type: "movie", videoId: "tt4700000", revalidateIfCached: true)
+        XCTAssertTrue(repo.isRevalidating(requestKey: key))
+        repo.prefetch(type: "movie", videoId: "tt4700000")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, 2, "prefetch of a key under revalidation must not start a duplicate discovery")
+        XCTAssertEqual(repo.state.groups.first { $0.addonId == "debrid" }?.streams.count, 2, "An add-on missing from the refresh keeps its cached streams")
+        XCTAssertNil(repo.state.groups.first { $0.addonId == "local.smb" }, "Local index groups are not carried forward")
+        XCTAssertEqual(repo.state.allStreams.count, 3)
+
+        now = now.addingTimeInterval(StreamsRepository.defaultMinimumRevalidateAge + 1)
+        phase = 2
+        repo.load(type: "movie", videoId: "tt4700000", revalidateIfCached: true)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, 3)
+        XCTAssertEqual(repo.state.groups.first { $0.addonId == "debrid" }?.streams.count, 2, "A still-missing add-on stays carried")
+        XCTAssertEqual(repo.state.groups.first { $0.addonId == "aio" }?.streams.count, 0, "A clean empty answer clears that add-on")
+    }
+
+    func testRevalidationCooldownSkipsRightAfterPrefetchAndDetailsObserverReceivesUpdate() async {
+        var now = Date(timeIntervalSince1970: 40_000)
+        var calls: [String] = []
+        var streamCount = 1
+        var slow = false
+        let repo = StreamsRepository.makeForTesting(
+            maxCacheEntries: 8,
+            cacheTTL: 300,
+            nowProvider: { now },
+            configuredAddonsProvider: { [URL(string: "https://addon.example/manifest.json")!] },
+            discoveryHandler: { [unowned self] _, _, videoId, _, publish in
+                calls.append(videoId)
+                let count = streamCount
+                if slow {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    guard !Task.isCancelled else { return }
+                }
+                publish([AddonStreamGroup(addonId: "a1", displayName: "Addon", streams: self.streams(for: videoId, count: count), isLoading: false)], false, nil, true)
+            }
+        )
+        let movie = NuvioMeta(id: "tt5000000", name: "Movie", type: "movie")
+        let key = StreamsRepository.requestKey(type: "movie", videoId: "tt5000000")
+
+        repo.prefetch(type: "movie", videoId: "tt5000000")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, ["tt5000000"])
+
+        now = now.addingTimeInterval(5)
+        let firstVisit = DetailsViewModel(repository: MockCatalogRepository(), streamsRepository: repo, streamDiscoveryMode: .shared)
+        firstVisit.triggerStreamPreFetch(for: movie)
+        XCTAssertFalse(repo.isRevalidating(requestKey: key))
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(calls, ["tt5000000"])
+        XCTAssertEqual(firstVisit.uiState.streams.count, 1)
+
+        now = now.addingTimeInterval(StreamsRepository.defaultMinimumRevalidateAge + 5)
+        streamCount = 2
+        slow = true
+        let revisit = DetailsViewModel(repository: MockCatalogRepository(), streamsRepository: repo, streamDiscoveryMode: .shared)
+        revisit.triggerStreamPreFetch(for: movie)
+        XCTAssertTrue(repo.isRevalidating(requestKey: key))
+        XCTAssertEqual(revisit.uiState.streams.count, 1)
+        XCTAssertFalse(revisit.uiState.isLoadingStreams)
+        let servedRevision = revisit.uiState.streamsRevision
+
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        XCTAssertEqual(calls, ["tt5000000", "tt5000000"])
+        XCTAssertFalse(repo.isRevalidating(requestKey: key))
+        XCTAssertEqual(revisit.uiState.streams.count, 2, "Details observer must receive the background revalidation result")
+        XCTAssertNotEqual(revisit.uiState.streamsRevision, servedRevision)
+        XCTAssertFalse(revisit.uiState.isLoadingStreams)
+    }
 }
 
 final class DetailsTargetPredictorAndProgressTests: XCTestCase {

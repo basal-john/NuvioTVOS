@@ -1210,7 +1210,8 @@ struct DetailsScreen: View {
                 forType: isSeries ? "series" : meta.type,
                 videoId: expectedStreamId,
                 season: expectedEpisode?.season,
-                episode: expectedEpisode?.episode
+                episode: expectedEpisode?.episode,
+                includeCompletedEmpty: true
             )
         let hasPreResolvedForTarget = preResolvedURL != nil && preResolvedStreamId == expectedStreamId
         let debridEnabled = DebridResolver(store: ProfileSettings.current).isEnabled
