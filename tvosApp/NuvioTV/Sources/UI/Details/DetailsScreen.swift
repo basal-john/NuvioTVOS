@@ -4504,7 +4504,7 @@ struct TvDetailsContent: View {
     @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = true
     @AppStorage(SettingsKey.trailerSound) private var trailerSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
-    @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
+    @AppStorage(SettingsKey.showFullDates) private var showFullDates = false
     @State private var configuredDetailsSections: [TVDetailsSection] = TVDetailsSectionOrder.currentOrder()
     @State private var disabledDetailsSections: Set<TVDetailsSection> = TVDetailsSectionOrder.disabledSections()
 
@@ -4607,7 +4607,7 @@ struct TvDetailsContent: View {
             stopBackgroundTrailer(manual: false)
         }
         DispatchQueue.main.async {
-            actionFocus = .trailer
+            actionFocus = .more
         }
     }
 
@@ -4787,14 +4787,22 @@ struct TvDetailsContent: View {
     private func actionRowView(
         meta: NuvioMeta,
         playTarget: TvDetailsPlayTarget,
+        continueItem: ContinueWatchingItem?,
         episodes: [NuvioVideo],
         scrollProxy: ScrollViewProxy
     ) -> some View {
         let canBypassPicker = smartStreamSelection || (reuseLastLink && hasStoredPlaybackStream(for: playTarget))
         TvDetailsActionRow(
+            metaName: meta.name,
             isInWatchlist: uiState.isInWatchlist,
             isWatched: isWatchedForDetails(meta),
             playTitle: playTarget.label,
+            playSubtext: TvDetailsHeroFormatter.playSubtext(
+                meta: meta,
+                playTarget: playTarget,
+                continueItem: continueItem,
+                canBypassPicker: canBypassPicker
+            ),
             playHint: canBypassPicker
                 ? L10n.string("details_play_hint_smart", fallback: "Plays the best link. Hold Select to choose a source manually.")
                 : L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources"),
@@ -4832,6 +4840,8 @@ struct TvDetailsContent: View {
                 cancelFocusRestoration()
                 onWatchedClick()
             },
+            mdbListUserRating: mdbListUserRating,
+            showMdbListRating: showMdbListRating,
             onRateClick: onRateClick != nil ? {
                 cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
@@ -5319,12 +5329,37 @@ struct TvDetailsContent: View {
                             .id(TvDetailsScrollID.topSection)
 
                             VStack(alignment: .leading, spacing: 0) {
-                                VStack(alignment: .leading, spacing: 32) {
+                                let regularSeasons = episodeGuide.seasons.filter { $0 > 0 }
+                                let seasonsCount = regularSeasons.isEmpty ? episodeGuide.seasons.count : regularSeasons.count
+                                let regularEpisodes = episodeGuide.episodes.filter { $0.season > 0 }
+                                let episodesCount = regularEpisodes.isEmpty ? episodeGuide.episodes.count : regularEpisodes.count
+
+                                VStack(alignment: .leading, spacing: 20) {
                                     Spacer(minLength: 0)
 
-                                    TvDetailsLogo(meta: meta)
+                                    HStack(alignment: .bottom, spacing: 64) {
+                                        VStack(alignment: .leading, spacing: 18) {
+                                            TvDetailsLogo(meta: meta, width: 540, height: 144)
 
-                                    if detailsActionsBelowInfo {
+                                            TvDetailsHeroMetadataLine(
+                                                meta: meta,
+                                                seasonsCount: seasonsCount,
+                                                episodesCount: episodesCount,
+                                                showFullDates: showFullDates
+                                            )
+
+                                            actionRowView(
+                                                meta: meta,
+                                                playTarget: playTarget,
+                                                continueItem: continueItem,
+                                                episodes: episodes,
+                                                scrollProxy: scrollProxy
+                                            )
+                                        }
+                                        .frame(width: 580, alignment: .bottomLeading)
+
+                                        Spacer(minLength: 24)
+
                                         TvDetailsSummary(
                                             meta: meta,
                                             creators: DetailsCreditLine.creators(in: uiState.people),
@@ -5332,21 +5367,27 @@ struct TvDetailsContent: View {
                                             isBackgroundTrailerPlaying: isTrailerPlaying && isTrailerRenderReady,
                                             isSynopsisFocused: false
                                         )
+                                        .frame(maxWidth: 840, alignment: .bottomLeading)
+                                        .padding(.bottom, 6)
+                                    }
+                                    .padding(.trailing, 16)
+                                    .frame(maxWidth: .infinity, alignment: .bottomLeading)
 
-                                        actionRowView(meta: meta, playTarget: playTarget, episodes: episodes, scrollProxy: scrollProxy)
-                                    } else {
-                                        actionRowView(meta: meta, playTarget: playTarget, episodes: episodes, scrollProxy: scrollProxy)
-
-                                        TvDetailsSummary(
-                                            meta: meta,
-                                            creators: DetailsCreditLine.creators(in: uiState.people),
-                                            simkl: uiState.simklRatings,
-                                            isBackgroundTrailerPlaying: isTrailerPlaying && isTrailerRenderReady,
-                                            isSynopsisFocused: false
-                                        )
+                                    if let scrollHint = TvDetailsHeroFormatter.scrollHint(
+                                        activeSections: activeDetailsSections,
+                                        hasEpisodes: !episodes.isEmpty,
+                                        hasCast: hasCastOrTrailer,
+                                        hasRelated: !relatedRowsAreEmpty(meta: meta)
+                                    ) {
+                                        Text(scrollHint.uppercased())
+                                            .font(.appFont(size: 15, weight: .semibold))
+                                            .tracking(1.0)
+                                            .foregroundColor(.white.opacity(0.36))
+                                            .lineLimit(1)
+                                            .padding(.top, 2)
                                     }
                                 }
-                            .padding(.bottom, 52)
+                            .padding(.bottom, 34)
                             .frame(height: max(proxy.size.height, 800), alignment: .bottomLeading)
 
                             let productionCompanies = uiState.companies.filter { $0.kind == .production && $0.tmdbId != nil }
@@ -6249,9 +6290,9 @@ struct TvDetailsContent: View {
         return abs(sectionIndex - currentIndex) <= 1
     }
 
-    // Give series more horizontal room so the episode cards aren't cramped.
+    // Full-bleed split hero width on both movies and series (matching episode-row span).
     private func detailsWidth(_ proxy: GeometryProxy, hasEpisodes: Bool) -> CGFloat {
-        hasEpisodes ? min(proxy.size.width - 96, 2200) : min(proxy.size.width * 0.64, 1180)
+        min(proxy.size.width - 96, 2200)
     }
 
     private func currentContinueWatchingItem(
@@ -6427,19 +6468,34 @@ private struct TvDetailsBackdrop: View {
             }
 
             GeometryReader { proxy in
-                LinearGradient(
-                    stops: [
-                        .init(color: backdropColor.opacity(0.96), location: 0),
-                        .init(color: backdropColor.opacity(0.85), location: 0.22),
-                        .init(color: backdropColor.opacity(0.52), location: 0.46),
-                        .init(color: backdropColor.opacity(0.14), location: 0.76),
-                        .init(color: .clear, location: 1)
-                    ],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                )
-                .frame(width: proxy.size.width * 0.58, height: proxy.size.height)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                ZStack {
+                    LinearGradient(
+                        stops: [
+                            .init(color: backdropColor.opacity(0.96), location: 0),
+                            .init(color: backdropColor.opacity(0.84), location: 0.22),
+                            .init(color: backdropColor.opacity(0.50), location: 0.46),
+                            .init(color: backdropColor.opacity(0.14), location: 0.76),
+                            .init(color: .clear, location: 1)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: proxy.size.width * 0.58, height: proxy.size.height)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: backdropColor.opacity(0.28), location: 0.36),
+                            .init(color: backdropColor.opacity(0.82), location: 0.76),
+                            .init(color: backdropColor.opacity(0.96), location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(width: proxy.size.width, height: proxy.size.height * 0.58)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                }
             }
 
         }
@@ -6538,11 +6594,12 @@ private struct TvDetailsLogo: View {
                                     .shadow(color: .black.opacity(0.65), radius: 10, y: 4)
                                     .multilineTextAlignment(alignment == .center ? .center : .leading)
                             }
-                            .frame(maxWidth: 560, alignment: alignment)
+                            .frame(maxWidth: width, alignment: alignment)
                         } else {
                             image
                                 .resizable()
                                 .scaledToFit()
+                                .shadow(color: .black.opacity(0.65), radius: 14, y: 6)
                         }
                     } else {
                         titleFallback
@@ -6567,11 +6624,185 @@ private struct TvDetailsLogo: View {
     }
 }
 
+/// Pure text formatting helpers for the Apple TV split details hero.
+enum TvDetailsHeroFormatter {
+    static func yearOrDate(for meta: NuvioMeta, showFullDates: Bool) -> String? {
+        if meta.isSeries {
+            if let info = meta.releaseInfo?.trimmingCharacters(in: .whitespacesAndNewlines), !info.isEmpty {
+                return info
+            }
+            return meta.year.map(String.init)
+        }
+        if showFullDates,
+           let formatted = NuvioDateDisplay.formattedDate(meta.released ?? meta.releaseInfo) {
+            return formatted
+        }
+        if let year = meta.year {
+            return String(year)
+        }
+        return NuvioDateDisplay.formattedDate(meta.released ?? meta.releaseInfo)
+    }
+
+    static func seriesLengthLabel(seasonsCount: Int, episodesCount: Int) -> String? {
+        var parts: [String] = []
+        if seasonsCount > 0 {
+            parts.append(seasonsCount == 1 ? "1 Season" : "\(seasonsCount) Seasons")
+        }
+        if episodesCount > 0 {
+            parts.append(episodesCount == 1 ? "1 Episode" : "\(episodesCount) Episodes")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    static func playSubtext(
+        meta: NuvioMeta,
+        playTarget: TvDetailsPlayTarget,
+        continueItem: ContinueWatchingItem?,
+        canBypassPicker: Bool
+    ) -> String? {
+        var parts: [String] = []
+        if let continueItem, !continueItem.isUpNextEntry {
+            if meta.isSeries,
+               let title = playTarget.episode?.title.trimmingCharacters(in: .whitespacesAndNewlines),
+               !title.isEmpty,
+               title.uppercased() != "TBA" {
+                parts.append(title)
+            }
+            if continueItem.duration > 0 {
+                let remaining = continueItem.remainingText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !remaining.isEmpty {
+                    parts.append(remaining)
+                }
+            }
+        }
+        if canBypassPicker {
+            if parts.isEmpty {
+                parts.append(L10n.string("details_hold_select_sources", fallback: "Auto-selects stream · Hold Select to switch source"))
+            } else {
+                parts.append(L10n.string("details_hold_select_short", fallback: "Hold Select for sources"))
+            }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    static func scrollHint(
+        activeSections: [TVDetailsSection],
+        hasEpisodes: Bool,
+        hasCast: Bool,
+        hasRelated: Bool
+    ) -> String? {
+        var labels: [String] = []
+        for section in activeSections {
+            switch section {
+            case .episodes where hasEpisodes:
+                labels.append("Episodes")
+            case .cast where hasCast:
+                labels.append("Cast")
+            case .related where hasRelated:
+                labels.append("More Like This")
+            default:
+                break
+            }
+        }
+        guard !labels.isEmpty else { return nil }
+        if labels.count == 1 {
+            return "Scroll down for \(labels[0])"
+        }
+        let head = labels.dropLast().joined(separator: ", ")
+        return "Scroll down for \(head) & \(labels.last!)"
+    }
+}
+
+private struct TvDetailsHeroMetadataLine: View {
+    let meta: NuvioMeta
+    let seasonsCount: Int
+    let episodesCount: Int
+    let showFullDates: Bool
+
+    var body: some View {
+        let yearText = TvDetailsHeroFormatter.yearOrDate(for: meta, showFullDates: showFullDates)
+        let runtimeText = meta.isSeries ? nil : NuvioRuntimeDisplay.formatted(meta.runtime)
+        let lengthText = meta.isSeries
+            ? TvDetailsHeroFormatter.seriesLengthLabel(seasonsCount: seasonsCount, episodesCount: episodesCount)
+            : nil
+        let badgeText = combinedBadgeText
+
+        if yearText != nil || runtimeText != nil || lengthText != nil || badgeText != nil {
+            HStack(spacing: 12) {
+                if let yearText {
+                    Text(yearText)
+                        .font(.appFont(size: 24, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.88))
+                }
+
+                if yearText != nil && (runtimeText != nil || badgeText != nil || lengthText != nil) {
+                    metaDot
+                }
+
+                if let runtimeText {
+                    Text(runtimeText)
+                        .font(.appFont(size: 24, weight: .medium))
+                        .foregroundColor(.white.opacity(0.86))
+
+                    if badgeText != nil {
+                        metaDot
+                    }
+                }
+
+                if let badgeText {
+                    Text(badgeText)
+                        .font(.appFont(size: 18, weight: .bold))
+                        .foregroundColor(.white.opacity(0.92))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 3)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .stroke(Color.white.opacity(0.45), lineWidth: 1.5)
+                        )
+
+                    if lengthText != nil {
+                        metaDot
+                    }
+                }
+
+                if let lengthText {
+                    Text(lengthText)
+                        .font(.appFont(size: 23, weight: .medium))
+                        .foregroundColor(.white.opacity(0.86))
+                }
+            }
+            .lineLimit(1)
+        }
+    }
+
+    private var metaDot: some View {
+        Text("·")
+            .font(.appFont(size: 24, weight: .bold))
+            .foregroundColor(.white.opacity(0.42))
+    }
+
+    private var combinedBadgeText: String? {
+        let cert = meta.certification?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanCert = (cert?.isEmpty == false) ? cert : nil
+        let status = meta.isSeries ? meta.statusBadgeLabel : nil
+        switch (cleanCert, status) {
+        case let (.some(c), .some(s)):
+            return "\(c)  |  \(s)"
+        case let (.some(c), .none):
+            return c
+        case let (.none, .some(s)):
+            return s
+        case (.none, .none):
+            return nil
+        }
+    }
+}
+
 /// Identifies the action-row buttons so focus can be driven programmatically
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, shuffle, party, watchlist, watched, rate, anilist, mal, trailer
+    case play, shuffle, party, watchlist, watched, rate, anilist, mal, trailer, more
 }
 
 private enum DetailsCastHeaderFocus: Hashable {
@@ -6579,9 +6810,11 @@ private enum DetailsCastHeaderFocus: Hashable {
 }
 
 private struct TvDetailsActionRow: View {
+    let metaName: String
     let isInWatchlist: Bool
     let isWatched: Bool
     var playTitle: String = L10n.string("action_play", fallback: "Play")
+    var playSubtext: String? = nil
     var playHint: String = L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources")
     let onPlayClick: () -> Void
     var onPlayLongPress: (() -> Void)? = nil
@@ -6607,14 +6840,19 @@ private struct TvDetailsActionRow: View {
     let entryLocked: Bool
     let onFocus: () -> Void
 
+    @State private var showingMoreDialog = false
+
     var body: some View {
-        HStack(spacing: 26) {
+        VStack(alignment: .leading, spacing: 14) {
             TvDetailsActionButton(
                 title: playTitle,
                 systemName: "play.fill",
                 accessibilityLabel: playTitle,
                 accessibilityHint: playHint,
                 isPrimary: true,
+                fillWidth: true,
+                height: 86,
+                cornerRadius: 20,
                 focus: focus,
                 tag: .play,
                 action: onPlayClick,
@@ -6623,147 +6861,119 @@ private struct TvDetailsActionRow: View {
                 onBack: onBack
             )
 
-            if let onShuffleClick {
+            if let playSubtext {
+                Text(playSubtext)
+                    .font(.appFont(size: 18, weight: .regular))
+                    .foregroundColor(.white.opacity(0.60))
+                    .lineLimit(1)
+                    .padding(.top, -4)
+            }
+
+            HStack(spacing: 12) {
+                TvDetailsActionButton(
+                    title: isInWatchlist
+                        ? L10n.string("details_in_library", fallback: "In library")
+                        : L10n.string("details_watchlist", fallback: "Watchlist"),
+                    systemName: isInWatchlist ? "checkmark" : "plus",
+                    accessibilityLabel: isInWatchlist
+                        ? L10n.string("details_in_library", fallback: "In library")
+                        : L10n.string("details_add_to_library", fallback: "Add to library"),
+                    accessibilityHint: isInWatchlist
+                        ? L10n.string("details_remove_from_library_hint", fallback: "Removes this title from your library")
+                        : L10n.string("details_add_to_library_hint", fallback: "Adds this title to your library"),
+                    isPrimary: false,
+                    fillWidth: true,
+                    height: 72,
+                    cornerRadius: 18,
+                    focus: focus,
+                    tag: .watchlist,
+                    action: onWatchlistClick,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+
+                TvDetailsActionButton(
+                    title: L10n.string("details_watched", fallback: "Watched"),
+                    systemName: isWatched ? "eye.fill" : "eye.slash.fill",
+                    accessibilityLabel: isWatched
+                        ? L10n.string("details_watched", fallback: "Watched")
+                        : L10n.string("details_not_watched", fallback: "Not watched"),
+                    accessibilityHint: isWatched
+                        ? L10n.string("details_mark_unwatched_hint", fallback: "Marks this title as unwatched")
+                        : L10n.string("details_mark_watched_hint", fallback: "Marks this title as watched"),
+                    isPrimary: false,
+                    fillWidth: true,
+                    height: 72,
+                    cornerRadius: 18,
+                    focus: focus,
+                    tag: .watched,
+                    action: onWatchedClick,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+
                 TvDetailsActionButton(
                     title: nil,
-                    systemName: isShuffleOn ? "shuffle.circle.fill" : "shuffle",
-                    accessibilityLabel: isShuffleOn
-                        ? L10n.string("details_shuffle_on", fallback: "Shuffle On")
-                        : L10n.string("details_shuffle", fallback: "Shuffle"),
-                    accessibilityHint: isShuffleOn
-                        ? L10n.string("details_shuffle_on_hint", fallback: "Turns shuffle off for this series")
-                        : L10n.string("details_shuffle_hint", fallback: "Plays a random episode, then keeps Up Next random"),
+                    systemName: isShuffleOn ? "ellipsis.circle.fill" : "ellipsis",
+                    accessibilityLabel: L10n.string("details_more_actions", fallback: "More actions"),
+                    accessibilityHint: L10n.string("details_more_actions_hint", fallback: "Trailer, manual source selection, watch party, and trackers"),
                     isPrimary: false,
+                    fixedWidth: 78,
+                    height: 72,
+                    cornerRadius: 18,
                     focus: focus,
-                    tag: .shuffle,
-                    action: onShuffleClick,
+                    tag: .more,
+                    action: { showingMoreDialog = true },
                     onFocus: onFocus,
                     onBack: onBack
                 )
                 .disabled(entryLocked)
             }
-
-            if let onHostWatchParty {
-                TvDetailsActionButton(
-                    title: nil,
-                    systemName: "person.2.fill",
-                    accessibilityLabel: "Create Watch Party",
-                    accessibilityHint: "Host a private room for this title",
-                    isPrimary: false,
-                    focus: focus,
-                    tag: .party,
-                    action: onHostWatchParty,
-                    onFocus: onFocus,
-                    onBack: onBack
-                )
-                .disabled(entryLocked)
-            }
-
-            TvDetailsActionButton(
-                title: nil,
-                systemName: isInWatchlist ? "checkmark" : "plus",
-                accessibilityLabel: isInWatchlist
-                    ? L10n.string("details_in_library", fallback: "In library")
-                    : L10n.string("details_add_to_library", fallback: "Add to library"),
-                accessibilityHint: isInWatchlist
-                    ? L10n.string("details_remove_from_library_hint", fallback: "Removes this title from your library")
-                    : L10n.string("details_add_to_library_hint", fallback: "Adds this title to your library"),
-                isPrimary: false,
-                focus: focus,
-                tag: .watchlist,
-                action: onWatchlistClick,
-                onFocus: onFocus,
-                onBack: onBack
-            )
-            .disabled(entryLocked)
-
-            if showMdbListRating {
-                TvDetailsActionButton(
-                    title: mdbListUserRating.map { "\($0)/10" },
-                    systemName: "star.fill",
-                    accessibilityLabel: mdbListUserRating.map { "MDBList rating \($0) out of 10" } ?? "Rate on MDBList",
-                    accessibilityHint: "Choose a personal rating on MDBList",
-                    isPrimary: false,
-                    focus: focus,
-                    tag: .rate,
-                    action: { onRateClick?() },
-                    onFocus: onFocus,
-                    onBack: onBack
-                )
-                .disabled(entryLocked)
-            }
-
-            if let onAniListClick {
-                TvDetailsActionButton(
-                    title: aniListTitle,
-                    systemName: "a.circle.fill",
-                    iconURL: URL(string: AniListMetaBuilder.ratingIcon),
-                    accessibilityLabel: aniListTitle.map { "AniList: \($0)" } ?? "AniList",
-                    accessibilityHint: "Changes this title on your AniList list",
-                    isPrimary: false,
-                    isWide: true,
-                    focus: focus,
-                    tag: .anilist,
-                    action: onAniListClick,
-                    onFocus: onFocus,
-                    onBack: onBack
-                )
-                .disabled(entryLocked)
-            }
-
-            if let onMALClick {
-                TvDetailsActionButton(
-                    title: malTitle,
-                    systemName: "m.circle.fill",
-                    iconAsset: MALEpisodeRatings.assetName,
-                    accessibilityLabel: malTitle.map { "MyAnimeList: \($0)" } ?? "MyAnimeList",
-                    accessibilityHint: "Changes this title on your MyAnimeList list",
-                    isPrimary: false,
-                    isWide: true,
-                    focus: focus,
-                    tag: .mal,
-                    action: onMALClick,
-                    onFocus: onFocus,
-                    onBack: onBack
-                )
-                .disabled(entryLocked)
-            }
-
-            TvDetailsActionButton(
-                title: nil,
-                systemName: isWatched ? "eye.fill" : "eye.slash.fill",
-                accessibilityLabel: isWatched
-                    ? L10n.string("details_watched", fallback: "Watched")
-                    : L10n.string("details_not_watched", fallback: "Not watched"),
-                accessibilityHint: isWatched
-                    ? L10n.string("details_mark_unwatched_hint", fallback: "Marks this title as unwatched")
-                    : L10n.string("details_mark_watched_hint", fallback: "Marks this title as watched"),
-                isPrimary: false,
-                focus: focus,
-                tag: .watched,
-                action: onWatchedClick,
-                onFocus: onFocus,
-                onBack: onBack
-            )
-            .disabled(entryLocked)
-
-            TvDetailsActionButton(
-                title: nil,
-                systemName: "play.rectangle.fill",
-                accessibilityLabel: L10n.string("details_trailer", fallback: "Trailer"),
-                accessibilityHint: L10n.string("details_trailer_hint", fallback: "Plays the trailer when available"),
-                isPrimary: false,
-                focus: focus,
-                tag: .trailer,
-                action: onTrailerClick,
-                onFocus: onFocus,
-                onBack: onBack
-            )
-            .disabled(entryLocked)
         }
         .focusSection()
         .onExitCommand {
             onBack?()
+        }
+        .confirmationDialog(metaName, isPresented: $showingMoreDialog, titleVisibility: .visible) {
+            Button(L10n.string("details_trailer", fallback: "Watch Trailer")) {
+                onTrailerClick()
+            }
+            if let onPlayLongPress {
+                Button(L10n.string("details_choose_source", fallback: "Choose Source Manually")) {
+                    onPlayLongPress()
+                }
+            }
+            if let onHostWatchParty {
+                Button(L10n.string("details_watch_party", fallback: "Create Watch Party")) {
+                    onHostWatchParty()
+                }
+            }
+            if let onShuffleClick {
+                Button(
+                    isShuffleOn
+                        ? L10n.string("details_shuffle_off", fallback: "Turn Off Shuffle")
+                        : L10n.string("details_shuffle", fallback: "Shuffle")
+                ) {
+                    onShuffleClick()
+                }
+            }
+            if showMdbListRating, let onRateClick {
+                Button(mdbListUserRating.map { "MDBList Rating (\($0)/10)" } ?? "Rate on MDBList") {
+                    onRateClick()
+                }
+            }
+            if let onAniListClick {
+                Button(aniListTitle.map { "AniList · \($0)" } ?? "AniList") {
+                    onAniListClick()
+                }
+            }
+            if let onMALClick {
+                Button(malTitle.map { "MyAnimeList · \($0)" } ?? "MyAnimeList") {
+                    onMALClick()
+                }
+            }
         }
     }
 }
@@ -7021,8 +7231,12 @@ private struct TvDetailsActionButton: View {
     let accessibilityLabel: String
     var accessibilityHint: String? = nil
     let isPrimary: Bool
-    /// As wide as its title, like Play, without being filled.
-    var isWide: Bool = false
+    /// Expands to fill its parent container horizontally (used by split-hero Play and secondary pills).
+    var fillWidth: Bool = false
+    /// Fixed width for compact square/pill buttons (e.g. More actions).
+    var fixedWidth: CGFloat? = nil
+    var height: CGFloat = 86
+    var cornerRadius: CGFloat = 20
     var focus: FocusState<DetailsActionFocus?>.Binding
     let tag: DetailsActionFocus
     let action: () -> Void
@@ -7034,6 +7248,7 @@ private struct TvDetailsActionButton: View {
     private var isFocused: Bool { focus.wrappedValue == tag }
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         Button(action: {
             if didTriggerHold {
                 didTriggerHold = false
@@ -7041,34 +7256,45 @@ private struct TvDetailsActionButton: View {
             }
             action()
         }) {
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 if iconURL != nil || iconAsset != nil {
-                    TvDetailsServiceIcon(url: iconURL, assetName: iconAsset, systemName: systemName, size: 44)
+                    TvDetailsServiceIcon(url: iconURL, assetName: iconAsset, systemName: systemName, size: 36)
                         .accessibilityHidden(true)
                 } else {
                     Image(systemName: systemName)
-                        .font(.system(size: isPrimary ? 30 : 36, weight: .bold))
+                        .font(.system(size: isPrimary ? 26 : 24, weight: .bold))
                         .accessibilityHidden(true)
                 }
 
                 if let title {
                     Text(title)
-                        .font(.appFont(size: 32, weight: .medium))
+                        .font(.appFont(size: isPrimary ? 28 : 23, weight: isPrimary ? .semibold : .medium))
                         .lineLimit(1)
+                        .minimumScaleFactor(0.75)
                         .accessibilityHidden(true)
                 }
             }
             .foregroundColor(foregroundColor)
-            .padding(.horizontal, isPrimary ? 44 : (isWide && title != nil ? 32 : 0))
-            .frame(minWidth: isPrimary ? 228 : 98, maxWidth: (isPrimary || isWide) ? nil : 98, minHeight: 98)
-            .frame(height: 98)
-            .modifier(TvDetailsGlassBackground(filled: isPrimary || isFocused, shape: Capsule()))
+            .padding(.horizontal, fixedWidth != nil ? 0 : (isPrimary ? 28 : 18))
+            .frame(
+                minWidth: fixedWidth ?? (isPrimary ? 228 : 98),
+                maxWidth: fixedWidth ?? (fillWidth ? .infinity : nil),
+                minHeight: height,
+                maxHeight: height
+            )
+            .modifier(TvDetailsGlassBackground(filled: isPrimary || isFocused, shape: shape))
+            .overlay(
+                shape.stroke(
+                    Color.white.opacity((isPrimary || isFocused) ? 0 : 0.20),
+                    lineWidth: 1
+                )
+            )
             .shadow(color: .black.opacity(isFocused ? 0.35 : 0.18), radius: isFocused ? 18 : 7, y: 8)
         }
         .buttonStyle(TvPlayActionButtonStyle(onHold: longPressAction, didTriggerHold: $didTriggerHold))
         .focused(focus, equals: tag)
         .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.08 : 1)
+        .scaleEffect(isFocused ? (fillWidth && isPrimary ? 1.035 : 1.055) : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .onChange(of: isFocused) { _, focused in
             if focused { onFocus() }
@@ -7120,153 +7346,61 @@ private struct TvDetailsSummary: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let creatorLine {
-                Text(creatorLine)
-                    .font(.appFont(size: 28, weight: .regular))
-                    .foregroundColor(.white.opacity(0.65))
-                    .padding(.bottom, 24)
+        VStack(alignment: .leading, spacing: 18) {
+            if let description = meta.description?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !description.isEmpty {
+                Text(description)
+                    .font(.appFont(size: 27, weight: .regular))
+                    .foregroundColor(.white.opacity(0.92))
+                    .lineSpacing(7)
+                    .lineLimit(4)
+                    .shadow(color: .black.opacity(0.75), radius: 12, y: 4)
+                    .frame(maxWidth: 840, alignment: .leading)
+            }
+
+            if creatorLine != nil || !genresList.isEmpty {
+                creditsAndGenresLine
             }
 
             if !externalRatingBadges.isEmpty {
                 TvDetailsRatingsRow(badges: externalRatingBadges)
-                    .padding(.bottom, 28)
-            }
-
-            if let description = meta.description, !description.isEmpty {
-                Text(description)
-                    .font(.appFont(size: 30, weight: .regular))
-                    .foregroundColor(.white)
-                    .lineSpacing(8)
-                    .lineLimit(5)
-                    .frame(maxWidth: 960, alignment: .leading)
-                    .padding(.bottom, 24)
-            }
-
-            if !primaryMetaItems.isEmpty || certificationLabel != nil || statusLabel != nil || !secondaryMetaItems.isEmpty {
-                VStack(alignment: .leading, spacing: 16) {
-                    if !primaryMetaItems.isEmpty {
-                        Text(primaryMetaItems.joined(separator: "  •  "))
-                            .font(.appFont(size: 27, weight: .medium))
-                            .foregroundColor(.white.opacity(0.60))
-                            .lineLimit(2)
-                    }
-
-                    if certificationLabel != nil || statusLabel != nil || !secondaryMetaItems.isEmpty {
-                        HStack(spacing: 14) {
-                            if certificationLabel != nil || statusLabel != nil {
-                                HStack(spacing: 10) {
-                                    if let certificationLabel {
-                                        Text(certificationLabel)
-                                            .font(.appFont(size: 22, weight: .semibold))
-                                            .foregroundColor(.white.opacity(0.88))
-                                    }
-
-                                    if certificationLabel != nil && statusLabel != nil {
-                                        Rectangle()
-                                            .fill(Color.white.opacity(0.35))
-                                            .frame(width: 1.5, height: 18)
-                                    }
-
-                                    if let statusLabel {
-                                        Text(statusLabel)
-                                            .font(.appFont(size: 22, weight: .semibold))
-                                            .foregroundColor(.white.opacity(0.88))
-                                    }
-                                }
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 6)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                        .stroke(Color.white.opacity(0.45), lineWidth: 1.5)
-                                )
-                            }
-
-                            if !secondaryMetaItems.isEmpty {
-                                Text(((certificationLabel != nil || statusLabel != nil) ? "•  " : "") + secondaryMetaItems.joined(separator: "  •  "))
-                                    .font(.appFont(size: 24, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.88))
-                                    .lineLimit(1)
-                            }
-                        }
-                    }
-                }
             }
         }
         .opacity(textOpacity)
         .animation(.easeInOut(duration: 0.35), value: textOpacity)
     }
 
+    @ViewBuilder
+    private var creditsAndGenresLine: some View {
+        let genresText = genresList.joined(separator: "  ·  ")
+        HStack(spacing: 12) {
+            if let creatorLine {
+                Text(creatorLine)
+                    .font(.appFont(size: 22, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.90))
+            }
+
+            if creatorLine != nil && !genresText.isEmpty {
+                Text("·")
+                    .font(.appFont(size: 22, weight: .bold))
+                    .foregroundColor(.white.opacity(0.42))
+            }
+
+            if !genresText.isEmpty {
+                Text(genresText)
+                    .font(.appFont(size: 22, weight: .medium))
+                    .foregroundColor(.white.opacity(0.66))
+            }
+        }
+        .lineLimit(1)
+    }
+
     private var creatorLine: String? {
         DetailsCreditLine.text(for: meta, creators: creators)
     }
 
-    private var certificationLabel: String? {
-        guard let cert = meta.certification?.trimmingCharacters(in: .whitespacesAndNewlines), !cert.isEmpty else {
-            return nil
-        }
-        return cert
-    }
-
-    /// Series status badge ("ENDED" / "ONGOING"); nil for movies.
-    private var statusLabel: String? { meta.statusBadgeLabel }
-
-    private var primaryMetaItems: [String] {
-        var items = Array((meta.genres ?? []).prefix(3))
-        // Series show the year range ("2026–"); movies show the full release date.
-        if meta.isSeries {
-            if let info = meta.releaseInfo, !info.isEmpty {
-                items.append(info)
-            } else if let year = meta.year {
-                items.append(String(year))
-            }
-        } else if let date = releaseDisplay {
-            items.append(date)
-        } else if let year = meta.year {
-            items.append(String(year))
-        }
-        return items
-    }
-
-    private var secondaryMetaItems: [String] {
-        var items: [String] = []
-        if let runtime = NuvioRuntimeDisplay.formatted(meta.runtime) {
-            items.append(runtime)
-        }
-        if let country = normalizedCountry(meta.country) {
-            items.append(country)
-        }
-        if let language = normalizedLanguage(meta.language) {
-            items.append(language)
-        }
-        return items
-    }
-
-    private func normalizedCountry(_ raw: String?) -> String? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return nil
-        }
-        let firstPart = raw.split(separator: ",").first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? raw
-        if firstPart.count == 2, firstPart.range(of: "^[A-Za-z]{2}$", options: .regularExpression) != nil {
-            let code = firstPart.uppercased()
-            return Locale.current.localizedString(forRegionCode: code) ?? code
-        }
-        return firstPart
-    }
-
-    private func normalizedLanguage(_ raw: String?) -> String? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return nil
-        }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.count == 2 || trimmed.count == 3 {
-            return trimmed.uppercased()
-        }
-        return trimmed.prefix(2).uppercased()
-    }
-
-    private var releaseDisplay: String? {
-        NuvioDateDisplay.formattedDate(meta.released ?? meta.releaseInfo)
+    private var genresList: [String] {
+        Array((meta.genres ?? []).prefix(3))
     }
 
     private var externalRatingBadges: [TvRatingBadge] {
@@ -7278,20 +7412,35 @@ private struct TvDetailsRatingsRow: View {
     let badges: [TvRatingBadge]
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 26) {
-                ForEach(badges) { badge in
-                    HStack(spacing: 9) {
-                        TvRatingIcon(visual: badge.visual, height: 38)
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        ViewThatFits(in: .horizontal) {
+            badgesContent
+            ScrollView(.horizontal, showsIndicators: false) {
+                badgesContent
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .modifier(TvDetailsGlassBackground(filled: false, shape: shape))
+        .overlay(
+            shape.stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+        .frame(maxWidth: 840, alignment: .leading)
+    }
 
-                        Text(badge.formattedValue)
-                            .font(.appFont(size: 28, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.62))
-                    }
+    private var badgesContent: some View {
+        HStack(spacing: 20) {
+            ForEach(badges) { badge in
+                HStack(spacing: 8) {
+                    TvRatingIcon(visual: badge.visual, height: 30)
+
+                    Text(badge.formattedValue)
+                        .font(.appFont(size: 23, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.90))
+                        .fixedSize()
                 }
             }
         }
-        .frame(maxWidth: 950, alignment: .leading)
     }
 }
 

@@ -106,3 +106,77 @@ final class DetailsCreditLineTests: XCTestCase {
         XCTAssertNil(TmdbPersonMetadata(name: "G", role: "  ", profileURL: nil, tmdbId: nil, credit: .cast).displayRole)
     }
 }
+
+final class TvDetailsHeroFormatterTests: XCTestCase {
+    func testYearOrDateFormatsMovieYearOrFullDate() {
+        let movie = NuvioMeta(
+            id: "tt10",
+            name: "Gentle Monster",
+            type: "movie",
+            year: 2026,
+            released: "2026-04-17"
+        )
+        XCTAssertEqual(TvDetailsHeroFormatter.yearOrDate(for: movie, showFullDates: false), "2026")
+        XCTAssertNotNil(TvDetailsHeroFormatter.yearOrDate(for: movie, showFullDates: true))
+    }
+
+    func testSeriesLengthLabelHandlesSingularAndPlural() {
+        XCTAssertEqual(TvDetailsHeroFormatter.seriesLengthLabel(seasonsCount: 1, episodesCount: 6), "1 Season · 6 Episodes")
+        XCTAssertEqual(TvDetailsHeroFormatter.seriesLengthLabel(seasonsCount: 3, episodesCount: 1), "3 Seasons · 1 Episode")
+        XCTAssertNil(TvDetailsHeroFormatter.seriesLengthLabel(seasonsCount: 0, episodesCount: 0))
+    }
+
+    func testPlaySubtextIncludesEpisodeTitleRemainingTimeAndHoldHint() {
+        let series = NuvioMeta(id: "tt11", name: "The Good Daughter", type: "series")
+        let ep = NuvioVideo(id: "s1e4", title: "What Happened to Rusty", season: 1, episode: 4)
+        let target = TvDetailsPlayTarget(episode: ep, label: "Resume S1 · E4", isPlayable: true)
+        let item = ContinueWatchingItem(
+            meta: series,
+            streamUrl: "https://example.com/s1e4.mkv",
+            position: 1680,
+            duration: 3000,
+            lastWatchedAt: Date(),
+            season: 1,
+            episode: 4
+        )
+        let sub = TvDetailsHeroFormatter.playSubtext(
+            meta: series,
+            playTarget: target,
+            continueItem: item,
+            canBypassPicker: true
+        )
+        XCTAssertNotNil(sub)
+        XCTAssertTrue(sub?.contains("What Happened to Rusty") == true)
+        XCTAssertTrue(sub?.contains("22m left") == true)
+        XCTAssertTrue(sub?.contains("Hold Select") == true)
+    }
+
+    func testScrollHintReflectsActivePopulatedSections() {
+        XCTAssertEqual(
+            TvDetailsHeroFormatter.scrollHint(
+                activeSections: [.episodes, .cast, .related],
+                hasEpisodes: true,
+                hasCast: true,
+                hasRelated: true
+            ),
+            "Scroll down for Episodes, Cast & More Like This"
+        )
+        XCTAssertEqual(
+            TvDetailsHeroFormatter.scrollHint(
+                activeSections: [.episodes, .cast, .related],
+                hasEpisodes: false,
+                hasCast: true,
+                hasRelated: true
+            ),
+            "Scroll down for Cast & More Like This"
+        )
+        XCTAssertNil(
+            TvDetailsHeroFormatter.scrollHint(
+                activeSections: [.episodes],
+                hasEpisodes: false,
+                hasCast: false,
+                hasRelated: false
+            )
+        )
+    }
+}
