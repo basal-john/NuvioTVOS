@@ -7,6 +7,21 @@ struct JellyfinLibrary: Identifiable, Equatable {
     let collectionType: String?
 }
 
+/// Per-item user playback state returned when `EnableUserData=true`.
+struct JellyfinUserItemData: Codable, Equatable, Sendable {
+    let playbackPositionTicks: Int64?
+    let played: Bool?
+    let lastPlayedDate: String?
+    let playCount: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case playbackPositionTicks = "PlaybackPositionTicks"
+        case played = "Played"
+        case lastPlayedDate = "LastPlayedDate"
+        case playCount = "PlayCount"
+    }
+}
+
 /// One item returned by a library items query. Jellyfin returns `Movie`,
 /// `Series`, and `Episode` items through the same shape, with type-dependent
 /// fields left `nil` — a `Series` carries the poster/overview/rating shown on
@@ -42,6 +57,58 @@ struct JellyfinMediaItem: Codable, Equatable {
     let indexNumber: Int?
     let container: String?
     let sizeBytes: Int64?
+    let seriesName: String?
+    let userData: JellyfinUserItemData?
+
+    init(
+        id: String,
+        name: String,
+        type: String,
+        overview: String?,
+        productionYear: Int?,
+        premiereDate: String?,
+        communityRating: Double?,
+        officialRating: String?,
+        genres: [String]?,
+        runTimeTicks: Int64?,
+        imdbId: String?,
+        tmdbId: Int?,
+        primaryImageTag: String?,
+        backdropImageTag: String?,
+        cast: [String]?,
+        directors: [String]?,
+        seriesId: String?,
+        parentIndexNumber: Int?,
+        indexNumber: Int?,
+        container: String?,
+        sizeBytes: Int64?,
+        seriesName: String? = nil,
+        userData: JellyfinUserItemData? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.type = type
+        self.overview = overview
+        self.productionYear = productionYear
+        self.premiereDate = premiereDate
+        self.communityRating = communityRating
+        self.officialRating = officialRating
+        self.genres = genres
+        self.runTimeTicks = runTimeTicks
+        self.imdbId = imdbId
+        self.tmdbId = tmdbId
+        self.primaryImageTag = primaryImageTag
+        self.backdropImageTag = backdropImageTag
+        self.cast = cast
+        self.directors = directors
+        self.seriesId = seriesId
+        self.parentIndexNumber = parentIndexNumber
+        self.indexNumber = indexNumber
+        self.container = container
+        self.sizeBytes = sizeBytes
+        self.seriesName = seriesName
+        self.userData = userData
+    }
 }
 
 struct JellyfinItemsPage {
@@ -280,14 +347,16 @@ struct JellyfinClient: Sendable {
             let ParentIndexNumber: Int?
             let IndexNumber: Int?
             let SeriesId: String?
+            let SeriesName: String?
             let People: [Person]?
             let ImageTags: ImageTags?
             let BackdropImageTags: [String]?
+            let UserData: JellyfinUserItemData?
 
             enum CodingKeys: String, CodingKey {
                 case Id, Name, Overview, ProductionYear, PremiereDate, CommunityRating, OfficialRating
                 case Genres, RunTimeTicks, ProviderIds, MediaSources, ParentIndexNumber, IndexNumber
-                case SeriesId, People, ImageTags, BackdropImageTags
+                case SeriesId, SeriesName, People, ImageTags, BackdropImageTags, UserData
                 case ItemType = "Type"
             }
             let ItemType: String?
@@ -355,7 +424,9 @@ struct JellyfinClient: Sendable {
             parentIndexNumber: item.ParentIndexNumber,
             indexNumber: item.IndexNumber,
             container: item.MediaSources?.first?.Container,
-            sizeBytes: item.MediaSources?.first?.Size
+            sizeBytes: item.MediaSources?.first?.Size,
+            seriesName: item.SeriesName,
+            userData: item.UserData
         )
     }
 
@@ -567,6 +638,134 @@ struct JellyfinClient: Sendable {
         return payload.MediaSources ?? []
     }
 
+    // MARK: - Continue Watching & Playback Progress
+
+    private static let progressItemFields = "Overview,ProductionYear,PremiereDate,RunTimeTicks,ProviderIds,ParentIndexNumber,IndexNumber,SeriesId,SeriesName"
+
+    /// Returns the user's in-progress items from `GET /Users/{userId}/Items/Resume`.
+    func resumeItems(userId: String, limit: Int = 50) async throws -> [JellyfinMediaItem] {
+        let (data, response) = try await get("Users/\(userId)/Items/Resume", query: [
+            "Limit": String(max(1, limit)),
+            "Fields": Self.progressItemFields,
+            "MediaTypes": "Video",
+            "EnableImages": "true",
+            "EnableUserData": "true"
+        ])
+        try Self.validate(response, data: data)
+        return try JSONDecoder().decode(ItemsPayload.self, from: data).Items.map {
+            Self.mapMediaItem($0)
+        }
+    }
+
+    /// Returns the user's Next Up series episodes from `GET /Shows/NextUp`.
+    func nextUpItems(userId: String, limit: Int = 50) async throws -> [JellyfinMediaItem] {
+        let (data, response) = try await get("Shows/NextUp", query: [
+            "UserId": userId,
+            "Limit": String(max(1, limit)),
+            "Fields": Self.progressItemFields,
+            "EnableImages": "true",
+            "EnableUserData": "true"
+        ])
+        try Self.validate(response, data: data)
+        return try JSONDecoder().decode(ItemsPayload.self, from: data).Items.map {
+            Self.mapMediaItem($0, fallbackType: "Episode")
+        }
+    }
+
+    /// Batch-fetches full item metadata for the given Jellyfin item IDs.
+    func items(userId: String, ids: [String]) async throws -> [JellyfinMediaItem] {
+        var uniqueIDs: [String] = []
+        var seen = Set<String>()
+        for id in ids where !id.isEmpty && seen.insert(id).inserted {
+            uniqueIDs.append(id)
+        }
+        guard !uniqueIDs.isEmpty else { return [] }
+
+        var fetched: [JellyfinMediaItem] = []
+        let chunkSize = 50
+        for start in stride(from: 0, to: uniqueIDs.count, by: chunkSize) {
+            let chunk = Array(uniqueIDs[start..<min(start + chunkSize, uniqueIDs.count)])
+            let (data, response) = try await get("Users/\(userId)/Items", query: [
+                "Ids": chunk.joined(separator: ","),
+                "Fields": Self.progressItemFields,
+                "EnableImages": "true",
+                "EnableUserData": "true"
+            ])
+            try Self.validate(response, data: data)
+            let payload = try JSONDecoder().decode(ItemsPayload.self, from: data)
+            fetched.append(contentsOf: payload.Items.map { Self.mapMediaItem($0) })
+        }
+        return fetched
+    }
+
+    /// Searches items on the server by title when resolving an item without an indexed match.
+    func searchItems(userId: String, term: String, includeItemTypes: String) async throws -> [JellyfinMediaItem] {
+        let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let (data, response) = try await get("Users/\(userId)/Items", query: [
+            "SearchTerm": trimmed,
+            "Recursive": "true",
+            "IncludeItemTypes": includeItemTypes,
+            "Fields": "ProviderIds,ProductionYear,PremiereDate",
+            "Limit": "25"
+        ])
+        try Self.validate(response, data: data)
+        return try JSONDecoder().decode(ItemsPayload.self, from: data).Items.map {
+            Self.mapMediaItem($0)
+        }
+    }
+
+    /// Reports playback start via `POST /Sessions/Playing`.
+    func reportPlaybackStart(itemId: String, positionTicks: Int64) async throws {
+        struct Body: Encodable {
+            let ItemId: String
+            let PositionTicks: Int64
+            let IsPaused: Bool
+        }
+        try await postEmpty("Sessions/Playing", body: Body(ItemId: itemId, PositionTicks: max(0, positionTicks), IsPaused: false))
+    }
+
+    /// Reports active or paused playback progress via `POST /Sessions/Playing/Progress`.
+    func reportPlaybackProgress(itemId: String, positionTicks: Int64, isPaused: Bool) async throws {
+        struct Body: Encodable {
+            let ItemId: String
+            let PositionTicks: Int64
+            let IsPaused: Bool
+        }
+        try await postEmpty("Sessions/Playing/Progress", body: Body(ItemId: itemId, PositionTicks: max(0, positionTicks), IsPaused: isPaused))
+    }
+
+    /// Reports playback stop via `POST /Sessions/Playing/Stopped`.
+    func reportPlaybackStopped(itemId: String, positionTicks: Int64) async throws {
+        struct Body: Encodable {
+            let ItemId: String
+            let PositionTicks: Int64
+        }
+        try await postEmpty("Sessions/Playing/Stopped", body: Body(ItemId: itemId, PositionTicks: max(0, positionTicks)))
+    }
+
+    /// Marks an item as played or unplayed via `/Users/{userId}/PlayedItems/{itemId}`.
+    func setPlayed(userId: String, itemId: String, played: Bool) async throws {
+        if played {
+            struct EmptyBody: Encodable {}
+            try await postEmpty("Users/\(userId)/PlayedItems/\(itemId)", body: EmptyBody())
+        } else {
+            try await deleteEmpty("Users/\(userId)/PlayedItems/\(itemId)")
+        }
+    }
+
+    /// Clears playback resume position and sets played state via `POST /Users/{userId}/Items/{itemId}/UserData`.
+    func updateUserData(userId: String, itemId: String, playbackPositionTicks: Int64, played: Bool) async throws {
+        struct Body: Encodable {
+            let PlaybackPositionTicks: Int64
+            let Played: Bool
+        }
+        try await postEmpty(
+            "Users/\(userId)/Items/\(itemId)/UserData",
+            body: Body(PlaybackPositionTicks: max(0, playbackPositionTicks), Played: played)
+        )
+    }
+
     // MARK: - Media URLs
 
     /// `{baseURL}/Items/{itemId}/Images/{type}?tag=...&api_key=...` — the
@@ -603,6 +802,24 @@ struct JellyfinClient: Sendable {
         var request = URLRequest(url: url)
         request.setValue(Self.authorizationHeader(token: accessToken), forHTTPHeaderField: "Authorization")
         return try await send(request)
+    }
+
+    private func postEmpty<Body: Encodable>(_ path: String, body: Body) async throws {
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(Self.authorizationHeader(token: accessToken), forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await send(request)
+        try Self.validate(response, data: data)
+    }
+
+    private func deleteEmpty(_ path: String) async throws {
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = "DELETE"
+        request.setValue(Self.authorizationHeader(token: accessToken), forHTTPHeaderField: "Authorization")
+        let (data, response) = try await send(request)
+        try Self.validate(response, data: data)
     }
 
     private func send(_ request: URLRequest) async throws -> (Data, URLResponse) {

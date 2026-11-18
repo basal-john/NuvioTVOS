@@ -9442,6 +9442,14 @@ enum WatchedStore {
             return id.isEmpty ? nil : id
         case .wetrakr:
             return WeTrakrProgressService.completionAccountID(in: store, profileId: profileId)
+        case .jellyfin:
+            guard RemoteTrackingState.isProgressSourceAuthenticated(
+                .jellyfin,
+                in: store,
+                profileScope: profileId
+            ) else { return nil }
+            let scope = profileId ?? ProfileSettings.activeProfileScope
+            return JellyfinProgressService.accountBindingID(in: store, profileScope: scope)
         case .nuvioSync:
             return nuvioSyncAccountBinding(profileId: profileId)
         }
@@ -9749,6 +9757,17 @@ enum WatchedStore {
                     )
                 }
             }
+            if RemoteTrackingState.shouldSyncWatchedHistory(to: .jellyfin, in: store) {
+                Task { @MainActor in
+                    _ = await JellyfinProgressService.setWatched(
+                        meta,
+                        season: season,
+                        episodes: episodes,
+                        isWatched: isWatched,
+                        store: store
+                    )
+                }
+            }
             if TraktSettingsStore.watchProgressSource(in: store) == .wetrakr
                 || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: store) {
                 for episode in episodes {
@@ -9880,6 +9899,17 @@ enum WatchedStore {
                     isWatched: isWatched,
                     store: traktStore,
                     profileScope: activeProfileId
+                )
+            }
+        }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .jellyfin, in: traktStore) {
+            Task { @MainActor in
+                _ = await JellyfinProgressService.setWatched(
+                    meta,
+                    season: season,
+                    episodes: episodeNumbers.sorted(),
+                    isWatched: isWatched,
+                    store: traktStore
                 )
             }
         }
@@ -10503,6 +10533,17 @@ enum WatchedStore {
                 )
             }
         }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .jellyfin, in: traktStore) {
+            Task { @MainActor in
+                _ = await JellyfinProgressService.setWatched(
+                    meta,
+                    season: season,
+                    episodes: episode.map { [$0] } ?? [],
+                    isWatched: true,
+                    store: traktStore
+                )
+            }
+        }
         if TraktSettingsStore.watchProgressSource(in: traktStore) == .wetrakr
             || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: traktStore) {
             _ = enqueueSelectedWeTrakrMutation(
@@ -10745,6 +10786,17 @@ enum WatchedStore {
                 )
             }
         }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .jellyfin, in: traktStore) {
+            Task { @MainActor in
+                _ = await JellyfinProgressService.setWatched(
+                    meta,
+                    season: season,
+                    episodes: episode.map { [$0] } ?? [],
+                    isWatched: false,
+                    store: traktStore
+                )
+            }
+        }
         if (TraktSettingsStore.watchProgressSource(in: traktStore) == .wetrakr
             || RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: traktStore)),
            enqueueSelectedWeTrakrMutation(
@@ -10805,7 +10857,7 @@ enum WatchedStore {
                     profileId: profileId
                 )
             }
-        case .simkl, .mdblist, .nuvioSync:
+        case .simkl, .mdblist, .jellyfin, .nuvioSync:
             break
         }
     }
@@ -10844,6 +10896,8 @@ enum WatchedStore {
                     profileId: profileId
                 )
             }
+        case .jellyfin:
+            break
         case .nuvioSync:
             Task { @MainActor in
                 NuvioSyncManager.current?.schedulePush(scope: .watched, delay: 0)

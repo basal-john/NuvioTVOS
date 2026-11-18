@@ -2071,6 +2071,7 @@ struct ContentView: View {
         Task { await SimklProgressService.removePlayback(for: item) }
         Task { @MainActor in await MdbListProgressService.removePlayback(for: item) }
         Task { @MainActor in await WeTrakrProgressService.removePlayback(for: item) }
+        Task { @MainActor in await JellyfinProgressService.removePlayback(for: item) }
 
         let keysArray = Array(keysToDelete)
         if !keysArray.isEmpty {
@@ -10993,7 +10994,7 @@ struct TVHomeView: View {
         // watched snapshots; Trakt is refreshed independently above so its
         // history remains available even when another provider owns resume.
         switch source {
-        case .nuvioSync, .trakt:
+        case .nuvioSync, .trakt, .jellyfin:
             break
         case .wetrakr:
             Task.detached(priority: .utility) {

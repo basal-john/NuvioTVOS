@@ -239,6 +239,7 @@ enum SettingsKey {
     static let simklScrobbleEnabled = "nuvio.tv.settings.integrations.simklScrobbleEnabled"
     static let mdbListScrobbleEnabled = "nuvio.tv.settings.integrations.mdbListScrobbleEnabled"
     static let wetrakrScrobbleEnabled = "nuvio.tv.settings.integrations.wetrakrScrobbleEnabled"
+    static let jellyfinScrobbleEnabled = "nuvio.tv.settings.integrations.jellyfinScrobbleEnabled"
     /// Set once the user picks a watch progress source by hand. Until then,
     /// connecting a tracker is allowed to select itself.
     static let watchProgressSourceChosenByUser = "nuvio.tv.settings.integrations.watchProgressSourceChosenByUser"
@@ -468,7 +469,7 @@ enum SettingsKey {
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI,
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
-        nuvioSyncScrobbleEnabled, traktScrobbleEnabled, simklScrobbleEnabled, mdbListScrobbleEnabled, wetrakrScrobbleEnabled,
+        nuvioSyncScrobbleEnabled, traktScrobbleEnabled, simklScrobbleEnabled, mdbListScrobbleEnabled, wetrakrScrobbleEnabled, jellyfinScrobbleEnabled,
         traktLibrarySourceMode, traktMoreLikeThisSource,
         simklClientID, simklAccessToken, simklRefreshToken, simklPlanToWatchHomeCatalogs,
         wetrakrClientID, wetrakrClientSecret, wetrakrAccessToken, wetrakrRefreshToken, wetrakrConnected,
@@ -5855,6 +5856,18 @@ private struct IntegrationSettingsView: View {
                         isOn: Binding(
                             get: { RemoteTrackingState.isScrobbleEnabled(for: .wetrakr) },
                             set: { RemoteTrackingState.setScrobbleEnabled($0, for: .wetrakr) }
+                        ),
+                        accentColor: accentColor
+                    )
+                }
+
+                if RemoteTrackingState.isProgressSourceAuthenticated(.jellyfin, in: ProfileSettings.current) {
+                    SettingsToggleRow(
+                        title: L10n.string("tvos_settings_jellyfin_scrobble", fallback: "Jellyfin Scrobble"),
+                        subtitle: L10n.string("tvos_settings_jellyfin_scrobble_subtitle", fallback: "Broadcast playback progress and watched updates to Jellyfin"),
+                        isOn: Binding(
+                            get: { RemoteTrackingState.isScrobbleEnabled(for: .jellyfin) },
+                            set: { RemoteTrackingState.setScrobbleEnabled($0, for: .jellyfin) }
                         ),
                         accentColor: accentColor
                     )

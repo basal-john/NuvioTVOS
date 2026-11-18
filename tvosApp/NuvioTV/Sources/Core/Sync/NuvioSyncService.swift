@@ -2267,6 +2267,11 @@ final class NuvioSyncManager: ObservableObject {
                 in: store,
                 profileScope: profileId
             )
+        case .jellyfin:
+            return !JellyfinProgressService.isAvailable(
+                in: store,
+                profileScope: profileId
+            )
         }
     }
 

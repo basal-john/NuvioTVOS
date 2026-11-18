@@ -402,6 +402,7 @@ enum TraktWatchProgressSource: String, CaseIterable, Codable, Hashable, Sendable
     case simkl = "SIMKL"
     case mdblist = "MDBLIST"
     case wetrakr = "WETRAKR"
+    case jellyfin = "JELLYFIN"
     case nuvioSync = "NUVIO_SYNC"
 
     var label: String {
@@ -410,6 +411,7 @@ enum TraktWatchProgressSource: String, CaseIterable, Codable, Hashable, Sendable
         case .simkl: return "Simkl"
         case .mdblist: return "MDBList"
         case .wetrakr: return "WeTrakr"
+        case .jellyfin: return "Jellyfin"
         case .nuvioSync: return "Nuvio Sync"
         }
     }
@@ -998,6 +1000,8 @@ enum RemoteTrackingState {
         case .wetrakr:
             return ProfileSettings.isActiveStore(store)
                 && WeTrakrRuntimeSession.authenticatedState(store: store, profileScope: profileScope) != nil
+        case .jellyfin:
+            return JellyfinProgressService.isAvailable(in: store, profileScope: profileScope)
         }
     }
 
@@ -1024,6 +1028,7 @@ enum RemoteTrackingState {
         case .simkl: key = SettingsKey.simklScrobbleEnabled
         case .mdblist: key = SettingsKey.mdbListScrobbleEnabled
         case .wetrakr: key = SettingsKey.wetrakrScrobbleEnabled
+        case .jellyfin: key = SettingsKey.jellyfinScrobbleEnabled
         case .nuvioSync: return false
         }
         return store.bool(forKey: key)
@@ -1053,6 +1058,7 @@ enum RemoteTrackingState {
         case .simkl: key = SettingsKey.simklScrobbleEnabled
         case .mdblist: key = SettingsKey.mdbListScrobbleEnabled
         case .wetrakr: key = SettingsKey.wetrakrScrobbleEnabled
+        case .jellyfin: key = SettingsKey.jellyfinScrobbleEnabled
         case .nuvioSync: return
         }
         store.set(enabled, forKey: key)
@@ -2331,6 +2337,15 @@ struct TraktProgressService {
             return finalizeContinueWatchingFetch(items, context: context)
         }
 
+        if source == .jellyfin {
+            guard RemoteTrackingState.isProgressSourceAuthenticated(.jellyfin, in: context.store, profileScope: context.profileScope) else { return [] }
+            guard let items = await JellyfinProgressService.fetchContinueWatching(
+                repository: repository,
+                store: context.store
+            ) else { return nil }
+            return finalizeContinueWatchingFetch(items, context: context)
+        }
+
         guard source == .trakt,
               TraktAuthStore.isAuthenticated(in: context.store) else {
             return []
@@ -2853,6 +2868,16 @@ struct TraktProgressService {
                 profileId: profileId,
                 session: session
             )
+        case .jellyfin:
+            return await JellyfinProgressService.reportPlayback(
+                meta: meta,
+                position: position,
+                duration: duration,
+                season: season,
+                episode: episode,
+                action: action,
+                store: store
+            )
         case .nuvioSync:
             return false
         }
@@ -3060,6 +3085,25 @@ struct TraktProgressService {
                 session: .shared
             )
             results.append(mdblistResult)
+        }
+
+        // Finalize Jellyfin if active
+        if RemoteTrackingState.isScrobbleEnabled(for: .jellyfin, in: store) || source == .jellyfin {
+            let jellyfinResult = await reportPlaybackSingleSource(
+                source: .jellyfin,
+                meta: meta,
+                position: position,
+                duration: duration,
+                season: season,
+                episode: episode,
+                action: .stop,
+                store: store,
+                expectedAccountID: nil,
+                playbackID: completionID,
+                profileId: profileId,
+                session: .shared
+            )
+            results.append(jellyfinResult)
         }
 
         return results.contains(true) || results.isEmpty
