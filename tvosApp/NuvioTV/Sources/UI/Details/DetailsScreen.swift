@@ -4959,13 +4959,12 @@ struct TvDetailsContent: View {
                 meta: meta,
                 playTarget: playTarget,
                 continueItem: continueItem,
-                canBypassPicker: canBypassPicker,
-                prefetchNote: playPrefetchProgress.phase == .hidden ? nil : playPrefetchProgress.statusNote
+                canBypassPicker: canBypassPicker
             ),
             playHint: canBypassPicker
                 ? L10n.string("details_play_hint_smart", fallback: "Plays the best link. Hold Select to choose a source manually.")
                 : L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources"),
-            playPrefetchProgress: playPrefetchProgress.phase == .hidden ? nil : playPrefetchProgress.fraction,
+            playPrefetchProgress: playPrefetchProgress.phase == .hidden ? nil : playPrefetchProgress,
             onPlayClick: {
                 handlePlayClick(playTarget: playTarget)
             },
@@ -7086,7 +7085,7 @@ private struct TvDetailsActionRow: View {
     var playTitle: String = L10n.string("action_play", fallback: "Play")
     var playSubtext: String? = nil
     var playHint: String = L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources")
-    var playPrefetchProgress: Double? = nil
+    var playPrefetchProgress: TvDetailsPrefetchProgress? = nil
     let onPlayClick: () -> Void
     var onPlayLongPress: (() -> Void)? = nil
     /// Series only: plays a random episode, and Up Next stays random.
@@ -7124,7 +7123,6 @@ private struct TvDetailsActionRow: View {
                 fillWidth: true,
                 height: 86,
                 cornerRadius: 20,
-                progressFraction: playPrefetchProgress,
                 focus: focus,
                 tag: .play,
                 action: onPlayClick,
@@ -7132,6 +7130,10 @@ private struct TvDetailsActionRow: View {
                 longPressAction: onPlayLongPress,
                 onBack: onBack
             )
+
+            if let playPrefetchProgress, playPrefetchProgress.phase != .hidden {
+                TvDetailsPrefetchCard(progress: playPrefetchProgress)
+            }
 
             if let playSubtext {
                 Text(playSubtext)
@@ -7509,7 +7511,6 @@ private struct TvDetailsActionButton: View {
     var fixedWidth: CGFloat? = nil
     var height: CGFloat = 86
     var cornerRadius: CGFloat = 20
-    var progressFraction: Double? = nil
     var focus: FocusState<DetailsActionFocus?>.Binding
     let tag: DetailsActionFocus
     let action: () -> Void
@@ -7518,7 +7519,6 @@ private struct TvDetailsActionButton: View {
     var onBack: (() -> Void)? = nil
 
     @State private var didTriggerHold = false
-    @State private var progressOpacity: Double = 1
     private var isFocused: Bool { focus.wrappedValue == tag }
 
     var body: some View {
@@ -7557,26 +7557,6 @@ private struct TvDetailsActionButton: View {
                 maxHeight: height
             )
             .modifier(TvDetailsGlassBackground(filled: isPrimary || isFocused, shape: shape))
-            .overlay(alignment: .bottom) {
-                if let fraction = progressFraction, isPrimary {
-                    GeometryReader { barProxy in
-                        let clamped = min(max(fraction, 0), 1)
-                        ZStack(alignment: .leading) {
-                            Capsule()
-                                .fill(Color.black.opacity(0.14))
-                            Capsule()
-                                .fill(Color.black.opacity(clamped >= 0.999 ? 0.85 : 0.76))
-                                .frame(width: max(8, barProxy.size.width * clamped))
-                                .animation(.easeOut(duration: 0.28), value: clamped)
-                        }
-                    }
-                    .frame(height: 3.5)
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 5)
-                    .opacity(progressOpacity)
-                    .allowsHitTesting(false)
-                }
-            }
             .clipShape(shape)
             .overlay(
                 shape.stroke(
@@ -7585,26 +7565,6 @@ private struct TvDetailsActionButton: View {
                 )
             )
             .shadow(color: .black.opacity(isFocused ? 0.35 : 0.18), radius: isFocused ? 18 : 7, y: 8)
-        }
-        .task(id: progressFraction) {
-            guard isPrimary, let fraction = progressFraction else {
-                progressOpacity = 0
-                return
-            }
-            if fraction >= 0.999 {
-                withAnimation(.easeOut(duration: 0.2)) {
-                    progressOpacity = 1
-                }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard !Task.isCancelled else { return }
-                withAnimation(.easeOut(duration: 0.35)) {
-                    progressOpacity = 0
-                }
-            } else {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    progressOpacity = 1
-                }
-            }
         }
         .buttonStyle(TvPlayActionButtonStyle(onHold: longPressAction, didTriggerHold: $didTriggerHold))
         .focused(focus, equals: tag)
@@ -7629,6 +7589,199 @@ private struct TvDetailsActionButton: View {
             return .black
         }
         return .white
+    }
+}
+
+/// Frosted glass card under the Play button that shows stream pre-fetch progress.
+/// Looping animations run only while a search is active and the scene is in the foreground.
+private struct TvDetailsPrefetchCard: View {
+    let progress: TvDetailsPrefetchProgress
+
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var sweepPosition: CGFloat = TvDetailsPrefetchCard.sweepRest
+
+    private static let sweepRest: CGFloat = -0.8
+    private static let sweepEnd: CGFloat = 1.3
+
+    private var isActive: Bool {
+        progress.phase == .searching || progress.phase == .resolvingDebrid
+    }
+
+    private var isEmptyResult: Bool {
+        progress.phase == .ready && progress.playableCount == 0 && progress.statusNote == "No sources found"
+    }
+
+    private var clamped: Double {
+        min(max(progress.fraction, 0), 1)
+    }
+
+    private var isAnimating: Bool {
+        isActive && scenePhase == .active && !reduceMotion
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+        TimelineView(.animation(paused: !isAnimating)) { context in
+            let time = context.date.timeIntervalSinceReferenceDate
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 10) {
+                    statusIndicator(time: time)
+                        .frame(width: 18, height: 18)
+                    Text(progress.statusNote ?? "")
+                        .font(.appFont(size: 19, weight: .medium))
+                        .foregroundColor(.white.opacity(0.92))
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    trailingLabel
+                }
+                track(time: time)
+                    .frame(height: 6)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(TvDetailsGlassBackground(filled: false, shape: shape))
+        .overlay {
+            GeometryReader { proxy in
+                LinearGradient(
+                    colors: [.clear, .white.opacity(0.22), .clear],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: proxy.size.width * 0.4, height: proxy.size.height * 2.4)
+                .rotationEffect(.degrees(18))
+                .offset(x: proxy.size.width * sweepPosition, y: -proxy.size.height * 0.7)
+            }
+        }
+        .clipShape(shape)
+        .overlay(shape.stroke(Color.white.opacity(0.20), lineWidth: 1))
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+        .onChange(of: progress.phase) { oldPhase, newPhase in
+            guard newPhase == .ready,
+                  oldPhase == .searching || oldPhase == .resolvingDebrid,
+                  !reduceMotion else { return }
+            runCompletionSweep()
+        }
+    }
+
+    @ViewBuilder
+    private func statusIndicator(time: TimeInterval) -> some View {
+        if isActive {
+            let pulse = loopPhase(time, period: 1.5)
+            ZStack {
+                Circle()
+                    .stroke(Color.white, lineWidth: 1)
+                    .frame(width: 8, height: 8)
+                    .scaleEffect(isAnimating ? 0.9 + 1.6 * pulse : 1)
+                    .opacity(isAnimating ? 0.75 * (1 - pulse) : 0)
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: 8, height: 8)
+            }
+        } else if isEmptyResult {
+            Image(systemName: "minus.circle")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(.white.opacity(0.45))
+        } else {
+            Image(systemName: "checkmark")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(.white)
+        }
+    }
+
+    @ViewBuilder
+    private var trailingLabel: some View {
+        if isActive {
+            Text("\(Int((clamped * 100).rounded()))%")
+                .font(.appFont(size: 17, weight: .semibold).monospacedDigit())
+                .foregroundColor(.white.opacity(0.62))
+        } else if !isEmptyResult {
+            Text(L10n.string("details_prefetch_ready", fallback: "Ready"))
+                .font(.appFont(size: 17, weight: .semibold))
+                .foregroundColor(.white.opacity(0.68))
+        }
+    }
+
+    private func track(time: TimeInterval) -> some View {
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            let fillWidth = max(10, width * clamped)
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.12))
+                    .overlay(alignment: .leading) {
+                        if isAnimating {
+                            let scanWidth = width * 0.28
+                            LinearGradient(
+                                colors: [.clear, .white.opacity(0.24), .clear],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                            .frame(width: scanWidth)
+                            .offset(x: -scanWidth + (width + scanWidth) * loopPhase(time, period: 1.9))
+                        }
+                    }
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(Color.white.opacity(0.06), lineWidth: 1))
+
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [.white.opacity(0.58), .white.opacity(0.92), .white],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .opacity(isEmptyResult ? 0.3 : 1)
+                    .frame(width: fillWidth)
+                    .overlay(alignment: .leading) {
+                        if isAnimating {
+                            let shineWidth = fillWidth * 0.4
+                            LinearGradient(
+                                colors: [.clear, .white, .clear],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                            .frame(width: shineWidth)
+                            .offset(x: -shineWidth + (fillWidth + shineWidth) * loopPhase(time, period: 1.4))
+                        }
+                    }
+                    .clipShape(Capsule())
+                    .animation(.easeOut(duration: 0.35), value: clamped)
+
+                if isActive {
+                    let breath = isAnimating ? 0.5 + 0.5 * sin(time * 2 * .pi / 1.6) : 0.5
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: .white.opacity(0.75), radius: 6 + 4 * breath)
+                        .offset(x: fillWidth - 4)
+                        .animation(.easeOut(duration: 0.35), value: clamped)
+                }
+            }
+        }
+    }
+
+    private func loopPhase(_ time: TimeInterval, period: Double) -> Double {
+        time.truncatingRemainder(dividingBy: period) / period
+    }
+
+    private func runCompletionSweep() {
+        sweepPosition = Self.sweepRest
+        withAnimation(.easeOut(duration: 1.0)) {
+            sweepPosition = Self.sweepEnd
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_100_000_000)
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                sweepPosition = Self.sweepRest
+            }
+        }
     }
 }
 
