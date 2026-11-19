@@ -1521,6 +1521,11 @@ struct TVHomeCatalogBrowseView: View {
 }
 
 enum TVCollectionFolderCardLayout {
+    struct EditorialArtworkChoice: Equatable {
+        let url: URL
+        let cropTopFocal: Bool
+    }
+
     static func cardHeight(layoutMode: String) -> CGFloat {
         layoutMode == "Compact" ? 255 : 315
     }
@@ -1554,6 +1559,99 @@ enum TVCollectionFolderCardLayout {
             offset += cardWidth(shape: folders[i].tileShape, layoutMode: layoutMode) + spacing
         }
         return offset
+    }
+
+    /// Unified editorial glass strip height for Home collection folder rows
+    /// (Watchlist, Moods & Vibes, Genres, streaming hubs) so discovery shelves
+    /// stay subordinate to 210×315 poster rows instead of stretching to 560×315.
+    static func folderCardHeight(layoutMode: String) -> CGFloat {
+        layoutMode == "Compact" ? 116 : 132
+    }
+
+    static func folderCardWidth(shape: CollectionTileShape, layoutMode: String) -> CGFloat {
+        let compact = layoutMode == "Compact"
+        switch shape {
+        case .landscape, .square:
+            return compact ? 242 : 276
+        case .poster:
+            return compact ? 170 : 210
+        }
+    }
+
+    static func folderRowSpacing(layoutMode: String) -> CGFloat {
+        layoutMode == "Compact" ? 20 : 24
+    }
+
+    static func folderScrollOffset(
+        to index: Int,
+        folders: [TVCollectionFolderItem],
+        layoutMode: String
+    ) -> CGFloat {
+        guard index > 0 else { return 0 }
+        let spacing = folderRowSpacing(layoutMode: layoutMode)
+        var offset: CGFloat = 0
+        let end = min(index, folders.count)
+        for i in 0..<end {
+            offset += folderCardWidth(shape: folders[i].tileShape, layoutMode: layoutMode) + spacing
+        }
+        return offset
+    }
+
+    static func usesLogoCoverPresentation(for folder: TVCollectionFolderItem) -> Bool {
+        let style = folder.presentationStyle?.uppercased()
+        return style == "STREAMING_SERVICE"
+            || style == "STUDIO_FRANCHISE"
+            || style == "BRAND_COLLECTION"
+    }
+
+    /// Chooses the cleanest still for an editorial collection tile. Prefers
+    /// textless backdrops (such as TMDB or `streaming-art/backdrops/`) when
+    /// available; otherwise crops the upper focal area of 16:9 banner covers so
+    /// baked-in lower-third uppercase labels stay outside the frame.
+    static func editorialArtwork(for folder: TVCollectionFolderItem) -> EditorialArtworkChoice? {
+        if !folder.focusGifEnabled,
+           let rawGif = folder.focusGifUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawGif.isEmpty,
+           let gifURL = URL(string: rawGif) {
+            return EditorialArtworkChoice(url: gifURL, cropTopFocal: false)
+        }
+
+        let cleanHeroURL: URL? = {
+            guard let raw = folder.heroBackdropUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty,
+                  let url = URL(string: raw) else { return nil }
+            let lower = raw.lowercased()
+            let isCleanBackdrop = lower.contains("image.tmdb.org")
+                || (lower.contains("/backdrops/") && !lower.contains("strand-backgrounds/focus/"))
+            return isCleanBackdrop ? url : nil
+        }()
+
+        if let cleanHeroURL {
+            return EditorialArtworkChoice(url: cleanHeroURL, cropTopFocal: false)
+        }
+
+        if let rawCover = folder.coverImageUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawCover.isEmpty,
+           let coverURL = URL(string: rawCover) {
+            return EditorialArtworkChoice(url: coverURL, cropTopFocal: true)
+        }
+
+        if let rawHero = folder.heroBackdropUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawHero.isEmpty,
+           let heroURL = URL(string: rawHero) {
+            let lower = rawHero.lowercased()
+            return EditorialArtworkChoice(url: heroURL, cropTopFocal: !lower.contains("image.tmdb.org"))
+        }
+
+        return nil
+    }
+
+    static func editorialSymbolName(for folder: TVCollectionFolderItem) -> String? {
+        let normalized = folder.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.contains("watchlist") || normalized.contains("watch list") {
+            return "bookmark.fill"
+        }
+        return nil
     }
 }
 
@@ -1623,11 +1721,11 @@ struct TVCollectionFolderRow: View {
     }
 
     private var rowSpacing: CGFloat {
-        TVCollectionFolderCardLayout.rowSpacing(layoutMode: homeLayout)
+        TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: homeLayout)
     }
 
     private var imageHeight: CGFloat {
-        TVCollectionFolderCardLayout.cardHeight(layoutMode: homeLayout)
+        TVCollectionFolderCardLayout.folderCardHeight(layoutMode: homeLayout)
     }
 
     private var stripHeight: CGFloat {
@@ -1635,7 +1733,9 @@ struct TVCollectionFolderRow: View {
     }
 
     private var showsAnyLabels: Bool {
-        posterLabels && folders.contains { !$0.hideTitle }
+        posterLabels && folders.contains {
+            TVCollectionFolderCardLayout.usesLogoCoverPresentation(for: $0) && !$0.hideTitle
+        }
     }
 
     private func materializedCardIndices(
@@ -1647,11 +1747,11 @@ struct TVCollectionFolderRow: View {
         let focusIndex = effectiveScrollIndex
         var lowerBound = max(0, focusIndex - 4)
         var upperBound = focusIndex
-        let spacing = TVCollectionFolderCardLayout.rowSpacing(layoutMode: layoutMode)
+        let spacing = TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: layoutMode)
         var coveredWidth: CGFloat = 0
 
         for index in focusIndex..<folders.count {
-            coveredWidth += TVCollectionFolderCardLayout.cardWidth(
+            coveredWidth += TVCollectionFolderCardLayout.folderCardWidth(
                 shape: folders[index].tileShape,
                 layoutMode: layoutMode
             ) + spacing
@@ -1732,8 +1832,8 @@ struct TVCollectionFolderRow: View {
         let rowPosterLabels = posterLabels
         let rowSmoothFocus = smoothFocus
         let rowFocusHighlighter = focusHighlighter
-        let rowSpacing = TVCollectionFolderCardLayout.rowSpacing(layoutMode: rowHomeLayout)
-        let scrollX = TVCollectionFolderCardLayout.scrollOffset(
+        let rowSpacing = TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: rowHomeLayout)
+        let scrollX = TVCollectionFolderCardLayout.folderScrollOffset(
             to: effectiveScrollIndex,
             folders: folders,
             layoutMode: rowHomeLayout
@@ -1792,7 +1892,7 @@ struct TVCollectionFolderRow: View {
         }
         .padding(
             .leading,
-            TVCollectionFolderCardLayout.scrollOffset(
+            TVCollectionFolderCardLayout.folderScrollOffset(
                 to: materializedCards.first?.index ?? 0,
                 folders: folders,
                 layoutMode: rowHomeLayout
@@ -1885,22 +1985,26 @@ struct TVCollectionFolderCard: View {
     private var showFocus: Bool { isFocused || retainFocusAppearance }
 
     private var cardWidth: CGFloat {
-        TVCollectionFolderCardLayout.cardWidth(shape: folder.tileShape, layoutMode: layoutMode)
+        TVCollectionFolderCardLayout.folderCardWidth(shape: folder.tileShape, layoutMode: layoutMode)
     }
 
     private var cardHeight: CGFloat {
-        TVCollectionFolderCardLayout.cardHeight(layoutMode: layoutMode)
+        TVCollectionFolderCardLayout.folderCardHeight(layoutMode: layoutMode)
     }
 
     /// Keep the focusable surface aligned with the standard portrait column
-    /// when a landscape folder is displayed. The artwork remains landscape,
-    /// but tvOS should use the leading edge for vertical row matching.
+    /// when a wider collection folder is displayed so vertical remote navigation
+    /// stays anchored to the leading edge of poster rows above and below.
     private var layoutWidth: CGFloat {
-        folder.tileShape == .landscape ? (layoutMode == "Compact" ? 170 : 210) : cardWidth
+        min(cardWidth, layoutMode == "Compact" ? 170 : 210)
+    }
+
+    private var showsBelowCardLabel: Bool {
+        showPosterLabels && usesLogoCoverPresentation && !folder.hideTitle
     }
 
     private var totalCardHeight: CGFloat {
-        cardHeight + (showPosterLabels && !folder.hideTitle ? 48 : 0)
+        cardHeight + (showsBelowCardLabel ? 48 : 0)
     }
 
     private var displayTitle: String {
@@ -1914,7 +2018,8 @@ struct TVCollectionFolderCard: View {
     }
 
     private var cardCornerRadius: CGFloat {
-        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
+        let base = AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
+        return base == 16 ? 14 : base
     }
 
     private var cardShape: RoundedRectangle {
@@ -1934,20 +2039,21 @@ struct TVCollectionFolderCard: View {
         return url
     }
 
+    private var editorialArtwork: TVCollectionFolderCardLayout.EditorialArtworkChoice? {
+        TVCollectionFolderCardLayout.editorialArtwork(for: folder)
+    }
+
+    private var editorialSymbolName: String? {
+        TVCollectionFolderCardLayout.editorialSymbolName(for: folder)
+    }
+
     private func isCoverGifURL(_ url: URL) -> Bool {
         let lower = url.absoluteString.lowercased()
         return lower.hasSuffix(".gif") || lower.contains(".gif?") || lower.contains("/gif")
     }
 
-    private var usesEmojiCover: Bool {
-        coverImageURL == nil && folder.coverEmoji != nil
-    }
-
     private var usesLogoCoverPresentation: Bool {
-        let style = folder.presentationStyle?.uppercased()
-        return style == "STREAMING_SERVICE"
-            || style == "STUDIO_FRANCHISE"
-            || style == "BRAND_COLLECTION"
+        TVCollectionFolderCardLayout.usesLogoCoverPresentation(for: folder)
     }
 
     private var emojiText: String? {
@@ -1960,16 +2066,16 @@ struct TVCollectionFolderCard: View {
     }
 
     private var focusedBorderColor: Color {
-        guard showFocus else { return .clear }
+        guard showFocus else { return Color.white.opacity(0.16) }
         return AppFocusOutline.color
     }
 
     private var focusedBorderWidth: CGFloat {
-        showFocus ? (focusHighlighterEnabled ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 0
+        showFocus ? (focusHighlighterEnabled ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 1
     }
 
     // Only the focused card casts a shadow (see PosterCard).
-    private var shadowOpacity: Double { showFocus ? 0.5 : 0 }
+    private var shadowOpacity: Double { showFocus ? 0.55 : 0 }
     private var shadowRadius: CGFloat { showFocus ? 16 : 0 }
 
     private var focusGifURLString: String? {
@@ -2003,6 +2109,11 @@ struct TVCollectionFolderCard: View {
             .frame(width: layoutWidth, height: totalCardHeight, alignment: .topLeading)
         }
         .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
+        .scaleEffect(showFocus ? 1.03 : 1.0)
+        .animation(
+            smoothFocusAnimations ? .interactiveSpring(response: 0.24, dampingFraction: 0.86) : nil,
+            value: showFocus
+        )
         .zIndex(showFocus ? 1 : 0)
     }
 
@@ -2010,7 +2121,7 @@ struct TVCollectionFolderCard: View {
         VStack(alignment: .leading, spacing: 9) {
             artTile
 
-            if showPosterLabels && !folder.hideTitle {
+            if showsBelowCardLabel {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(displayTitle)
                         .font(.system(size: 20, weight: .semibold))
@@ -2030,12 +2141,14 @@ struct TVCollectionFolderCard: View {
 
     @ViewBuilder
     private var artTile: some View {
-        if let url = coverImageURL {
-            imageCover(url: url)
-        } else if usesEmojiCover {
-            emojiGlassCover
+        if usesLogoCoverPresentation {
+            if let url = coverImageURL {
+                logoImageCover(url: url)
+            } else {
+                editorialGlassCover(artwork: nil)
+            }
         } else {
-            emptyCover
+            editorialGlassCover(artwork: editorialArtwork)
         }
     }
 
@@ -2050,18 +2163,16 @@ struct TVCollectionFolderCard: View {
         }
     }
 
-    private func imageCover(url: URL) -> some View {
+    private func logoImageCover(url: URL) -> some View {
         ZStack {
-            if usesLogoCoverPresentation {
-                Color.clear
-                    .frame(width: cardWidth, height: cardHeight)
-                    .modifier(
-                        LiquidGlassSurface(
-                            cornerRadius: cardCornerRadius,
-                            prominent: showFocus
-                        )
+            Color.clear
+                .frame(width: cardWidth, height: cardHeight)
+                .modifier(
+                    LiquidGlassSurface(
+                        cornerRadius: cardCornerRadius,
+                        prominent: showFocus
                     )
-            }
+                )
             if isCoverGifURL(url) {
                 AnimatedRemoteGIFView(urlString: url.absoluteString, isActive: showFocus)
                     .frame(width: cardWidth, height: cardHeight)
@@ -2070,17 +2181,11 @@ struct TVCollectionFolderCard: View {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .success(let image):
-                        if usesLogoCoverPresentation {
-                            image
-                                .resizable()
-                                .scaledToFit()
-                                .padding(.horizontal, cardWidth * 0.10)
-                                .padding(.vertical, cardHeight * 0.10)
-                        } else {
-                            image
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                        }
+                        image
+                            .resizable()
+                            .scaledToFit()
+                            .padding(.horizontal, cardWidth * 0.14)
+                            .padding(.vertical, cardHeight * 0.16)
                     default:
                         emptyCoverFill
                     }
@@ -2091,41 +2196,102 @@ struct TVCollectionFolderCard: View {
         .frame(width: cardWidth, height: cardHeight)
         .clipped()
         .clipShape(cardShape)
-        .overlay(cardShape.stroke(focusedBorderColor, lineWidth: focusedBorderWidth))
-        .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius)
+        .overlay(cardShape.strokeBorder(focusedBorderColor, lineWidth: focusedBorderWidth))
+        .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, y: showFocus ? 10 : 0)
     }
 
-    private var emojiGlassCover: some View {
-        ZStack {
-            ZStack {
-                coverGlyph
+    private func editorialGlassCover(artwork: TVCollectionFolderCardLayout.EditorialArtworkChoice?) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            if let artwork {
+                if isCoverGifURL(artwork.url) {
+                    AnimatedRemoteGIFView(urlString: artwork.url.absoluteString, isActive: showFocus)
+                        .frame(width: cardWidth, height: cardHeight)
+                        .clipped()
+                } else {
+                    AsyncImage(url: artwork.url) { phase in
+                        switch phase {
+                        case .success(let image):
+                            if artwork.cropTopFocal {
+                                let scaledWidth = (cardWidth * 1.25).rounded()
+                                let scaledHeight = (scaledWidth * 9.0 / 16.0).rounded()
+                                image
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: scaledWidth, height: scaledHeight, alignment: .top)
+                                    .frame(width: cardWidth, height: cardHeight, alignment: .top)
+                                    .clipped()
+                            } else {
+                                image
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: cardWidth, height: cardHeight, alignment: .center)
+                                    .clipped()
+                            }
+                        default:
+                            emptyCoverFill
+                        }
+                    }
+                }
+            } else {
+                ZStack(alignment: .topTrailing) {
+                    Color.clear
+                        .frame(width: cardWidth, height: cardHeight)
+                        .modifier(LiquidGlassSurface(cornerRadius: cardCornerRadius, prominent: showFocus))
+                    coverGlyph
+                        .opacity(0.65)
+                        .padding(.top, 14)
+                        .padding(.trailing, 16)
+                }
             }
-            .frame(width: cardWidth, height: cardHeight)
-            .modifier(LiquidGlassSurface(cornerRadius: cardCornerRadius, prominent: showFocus))
 
             focusGifOverlay
-                .clipShape(cardShape)
-        }
-        .frame(width: cardWidth, height: cardHeight)
-        .overlay(cardShape.stroke(focusedBorderColor, lineWidth: focusedBorderWidth))
-        .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius)
-    }
 
-    private var emptyCover: some View {
-        ZStack {
-            emptyCoverFill
-            coverGlyph
-            focusGifOverlay
+            // Cinema scrim + subtle top-left glass sheen for crisp 10ft legibility.
+            LinearGradient(
+                stops: [
+                    .init(color: Color.black.opacity(0.08), location: 0.0),
+                    .init(color: Color.black.opacity(0.28), location: 0.45),
+                    .init(color: Color.black.opacity(0.88), location: 1.0)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .allowsHitTesting(false)
+
+            LinearGradient(
+                colors: [Color.white.opacity(showFocus ? 0.16 : 0.10), .clear],
+                startPoint: .topLeading,
+                endPoint: .center
+            )
+            .allowsHitTesting(false)
+
+            HStack(spacing: 8) {
+                if let symbolName = editorialSymbolName {
+                    Image(systemName: symbolName)
+                        .font(.system(size: layoutMode == "Compact" ? 14 : 15, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.92))
+                }
+                Text(displayTitle)
+                    .font(.system(size: layoutMode == "Compact" ? 18 : 20, weight: .semibold))
+                    .tracking(-0.3)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .shadow(color: .black.opacity(0.70), radius: 6, y: 1)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 13)
         }
         .frame(width: cardWidth, height: cardHeight)
+        .clipped()
         .clipShape(cardShape)
-        .overlay(cardShape.stroke(focusedBorderColor, lineWidth: focusedBorderWidth))
-        .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius)
+        .overlay(cardShape.strokeBorder(focusedBorderColor, lineWidth: focusedBorderWidth))
+        .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, y: showFocus ? 10 : 0)
     }
 
     private var emptyCoverFill: some View {
         Rectangle()
-            .fill(Color.white.opacity(0.07))
+            .fill(Color.white.opacity(0.08))
     }
 
     @ViewBuilder
@@ -2135,7 +2301,7 @@ struct TVCollectionFolderCard: View {
                 .font(.system(size: emojiFontSize))
         } else {
             Image(systemName: "folder")
-                .font(.system(size: 40))
+                .font(.system(size: 32))
                 .foregroundColor(.white.opacity(0.25))
         }
     }

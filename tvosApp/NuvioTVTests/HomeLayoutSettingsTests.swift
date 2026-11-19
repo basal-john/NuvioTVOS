@@ -1726,6 +1726,99 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertEqual(TVCollectionFolderCardLayout.cardWidth(shape: .square, layoutMode: "Modern"), 315)
     }
 
+    func testTVCollectionFolderEditorialUnifiedSizingAndArtworkSelection() throws {
+        // Unified compact editorial dimensions for collection folder rows
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardHeight(layoutMode: "Modern"), 132)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardHeight(layoutMode: "Compact"), 116)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .landscape, layoutMode: "Modern"), 276)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .square, layoutMode: "Modern"), 276)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .poster, layoutMode: "Modern"), 210)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .landscape, layoutMode: "Compact"), 242)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .square, layoutMode: "Compact"), 242)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .poster, layoutMode: "Compact"), 170)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: "Modern"), 24)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: "Compact"), 20)
+
+        let watchlistJSON = """
+        {
+          "id": "ws-wl",
+          "title": "Watchlist",
+          "coverImageUrl": "https://raw.githubusercontent.com/basal-john/streaming-art/main/covers/lineup-watchlist.jpg",
+          "heroBackdropUrl": "https://raw.githubusercontent.com/basal-john/streaming-art/main/backdrops/lineup-watchlist.jpg",
+          "tileShape": "LANDSCAPE",
+          "hideTitle": true,
+          "sources": []
+        }
+        """
+        let moodJSON = """
+        {
+          "id": "mood-cozy",
+          "title": "Cozy & Comforting",
+          "coverImageUrl": "https://wepiii2.github.io/strand-backgrounds/icons/a76463a3fd68e69caf6b.jpg",
+          "heroBackdropUrl": "https://wepiii2.github.io/strand-backgrounds/focus/ee3b342c-a2f5-45ce-8f9b-ad2d2471a4f3.jpg",
+          "tileShape": "LANDSCAPE",
+          "hideTitle": true,
+          "sources": []
+        }
+        """
+        let tmdbGenreJSON = """
+        {
+          "id": "genre-action",
+          "title": "Action & Adventure",
+          "coverEmoji": "💥",
+          "heroBackdropUrl": "https://image.tmdb.org/t/p/w1280/sSIzzVhhLfgLKVBcAUv0X6cLYz9.jpg",
+          "tileShape": "SQUARE",
+          "hideTitle": false,
+          "sources": []
+        }
+        """
+
+        let decoder = JSONDecoder()
+        let watchlistFolder = TVCollectionFolderItem(
+            collectionId: "c1",
+            folder: try decoder.decode(NuvioCollectionFolder.self, from: Data(watchlistJSON.utf8)),
+            sources: []
+        )
+        let moodFolder = TVCollectionFolderItem(
+            collectionId: "c2",
+            folder: try decoder.decode(NuvioCollectionFolder.self, from: Data(moodJSON.utf8)),
+            sources: []
+        )
+        let tmdbGenreFolder = TVCollectionFolderItem(
+            collectionId: "c3",
+            folder: try decoder.decode(NuvioCollectionFolder.self, from: Data(tmdbGenreJSON.utf8)),
+            sources: []
+        )
+
+        // Scroll offset uses unified 276pt width + 24pt spacing
+        XCTAssertEqual(
+            TVCollectionFolderCardLayout.folderScrollOffset(
+                to: 2,
+                folders: [watchlistFolder, moodFolder, tmdbGenreFolder],
+                layoutMode: "Modern"
+            ),
+            600
+        )
+
+        // Watchlist prefers clean textless streaming-art backdrop without top-crop
+        let watchlistArt = TVCollectionFolderCardLayout.editorialArtwork(for: watchlistFolder)
+        XCTAssertEqual(watchlistArt?.url.absoluteString, "https://raw.githubusercontent.com/basal-john/streaming-art/main/backdrops/lineup-watchlist.jpg")
+        XCTAssertEqual(watchlistArt?.cropTopFocal, false)
+        XCTAssertEqual(TVCollectionFolderCardLayout.editorialSymbolName(for: watchlistFolder), "bookmark.fill")
+
+        // Mood banner uses coverImageUrl with top-focal crop to hide baked-in uppercase text
+        let moodArt = TVCollectionFolderCardLayout.editorialArtwork(for: moodFolder)
+        XCTAssertEqual(moodArt?.url.absoluteString, "https://wepiii2.github.io/strand-backgrounds/icons/a76463a3fd68e69caf6b.jpg")
+        XCTAssertEqual(moodArt?.cropTopFocal, true)
+        XCTAssertNil(TVCollectionFolderCardLayout.editorialSymbolName(for: moodFolder))
+
+        // Built-in Discover by Genre uses textless TMDB backdrop without top-crop
+        let genreArt = TVCollectionFolderCardLayout.editorialArtwork(for: tmdbGenreFolder)
+        XCTAssertEqual(genreArt?.url.absoluteString, "https://image.tmdb.org/t/p/w1280/sSIzzVhhLfgLKVBcAUv0X6cLYz9.jpg")
+        XCTAssertEqual(genreArt?.cropTopFocal, false)
+        XCTAssertNil(TVCollectionFolderCardLayout.editorialSymbolName(for: tmdbGenreFolder))
+    }
+
     func testLargePayloadStorePurgesLegacyOversizedPreferences() {
         let suite = UserDefaults(suiteName: "nuvio.test.purge.\(UUID().uuidString)")!
         defer { suite.removePersistentDomain(forName: suite.description) }

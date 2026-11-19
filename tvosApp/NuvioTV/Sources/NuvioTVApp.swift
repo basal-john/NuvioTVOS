@@ -9268,11 +9268,14 @@ struct TVHomeView: View {
         return stripHeight + TVHomeLayout.rowTitleBlock
     }
 
-    /// Collection folder row estimate. Curated templates may hide every folder
-    /// label even when poster labels are enabled globally.
+    /// Collection folder row estimate. Editorial tiles render their title inside
+    /// the compact glass frame, so only logo-based rows ever reserve below-card
+    /// label space when poster labels are enabled globally.
     private func estimatedCollectionRowHeight(for section: TVHomeSection) -> CGFloat {
-        let imageHeight: CGFloat = homeLayout == "Compact" ? 255 : 315
-        let showsLabels = posterLabels && section.collectionFolders.contains { !$0.hideTitle }
+        let imageHeight = TVCollectionFolderCardLayout.folderCardHeight(layoutMode: homeLayout)
+        let showsLabels = posterLabels && section.collectionFolders.contains {
+            TVCollectionFolderCardLayout.usesLogoCoverPresentation(for: $0) && !$0.hideTitle
+        }
         let stripHeight = imageHeight + (showsLabels ? 48 : 0) + TVHomeLayout.stripVerticalPadding * 2
         return stripHeight + TVHomeLayout.rowTitleBlock
     }

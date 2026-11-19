@@ -140,4 +140,17 @@ final class PlayerMediaBadgeTests: XCTestCase {
         XCTAssertTrue(vm.showControls)
     }
 
+    private func telemetry(engine: String, codec: String?, channels: Int?, spatial: String?) -> PlayerTelemetry {
+        PlayerTelemetry(
+            info: ScenePlaybackInfo(
+                engine: engine,
+                videoCodec: "AV1",
+                resolution: "3840 × 2160",
+                dynamicRange: "HDR10+",
+                audioCodec: codec ?? "—",
+                audioChannels: channels.map { "\($0)ch" } ?? "—",
+                audioSpatialFormat: spatial ?? "—"
+            )
+        )
+    }
 }
