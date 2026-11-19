@@ -148,6 +148,8 @@ enum SettingsKey {
     static let homeCatalogDisabledAddonIDs = "nuvio.tv.settings.layout.homeCatalogDisabledAddonIDs"
     static let homeCatalogDisabledAddonNames = "nuvio.tv.settings.layout.homeCatalogDisabledAddonNames"
     static let homeHiddenAddonIDs = "nuvio.tv.settings.layout.homeHiddenAddonIDs"
+    /// Stream add-ons the viewer chose to keep on Home, overriding the automatic hide.
+    static let homeShownAddonIDs = "nuvio.tv.settings.layout.homeShownAddonIDs"
     /// Collection ids hidden from Home via the account layout sync.
     static let homeCollectionDisabled = "nuvio.tv.settings.layout.homeCollectionDisabled"
     /// JSON `[String]` of account catalog keys (`<addonId>_<type>_<catalogId>`)
@@ -14302,6 +14304,7 @@ private struct AdvancedSettingsView: View {
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonIDs)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonNames)
         defaults.removeObject(forKey: SettingsKey.homeHiddenAddonIDs)
+        defaults.removeObject(forKey: SettingsKey.homeShownAddonIDs)
         AISubtitleKeyStore.remove()
         Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: ProfileSettings.activeProfileScope) }
     }

@@ -1110,9 +1110,17 @@ final class CinemetaCatalogRepository: CatalogRepository {
         var hadFailures = false
         Self.homeAddonFetchDiagnostic = "loading"
 
+        var resolvedManifests: [URL: AddonManifest] = [:]
         for manifestURL in Self.configuredStreamAddonManifestURLs {
             guard !Task.isCancelled else { break }
-            let resolvedManifest = await manifest(for: manifestURL)
+            resolvedManifests[manifestURL] = await manifest(for: manifestURL)
+        }
+        let metadataOnlyAddonInstalled = resolvedManifests.values.contains {
+            $0.id != Self.cinemetaAddonId && $0.servesResource("catalog") && !$0.servesResource("stream")
+        }
+        for manifestURL in Self.configuredStreamAddonManifestURLs {
+            guard !Task.isCancelled else { break }
+            let resolvedManifest = resolvedManifests[manifestURL]
             guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else { break }
             guard let manifest = resolvedManifest else {
                 hadFailures = true
@@ -1120,6 +1128,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 continue
             }
             guard manifest.id != Self.cinemetaAddonId else { continue }
+            if TVHomeCatalogOrder.autoHideStreamAddonIfNeeded(
+                addonID: manifest.id,
+                servesStreams: manifest.servesResource("stream"),
+                metadataOnlyAddonInstalled: metadataOnlyAddonInstalled
+            ) {
+                print("[HomeAddon] auto-hidden stream add-on catalogs on Home")
+            }
 
             let base = manifestURL.deletingLastPathComponent()
             let addonDisplayName = Self.streamAddonDisplayName(for: manifestURL, manifestName: manifest.displayName)
@@ -3272,6 +3287,14 @@ private struct AddonManifest: Decodable {
 
     // Work around an Xcode 27 beta LICM optimizer crash in this small manifest loop.
     @_optimize(none)
+    /// Whether the manifest declares the resource at all, for any type or id.
+    func servesResource(_ name: String) -> Bool {
+        if name.caseInsensitiveCompare("catalog") == .orderedSame, !(catalogs ?? []).isEmpty {
+            return true
+        }
+        return (resources ?? []).contains { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+    }
+
     func supportsResource(_ name: String, type: String, id: String) -> Bool {
         guard let resources, !resources.isEmpty else { return false }
         let fallbackTypes = types ?? []

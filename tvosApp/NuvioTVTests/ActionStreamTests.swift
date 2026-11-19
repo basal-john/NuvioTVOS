@@ -291,3 +291,53 @@ final class SmartPlaybackTorBoxPreferenceTests: XCTestCase {
         XCTAssertFalse(SmartPlaybackSelector.isTorBoxStream(NuvioStream(url: "https://x/a", name: "TBS Special 1080p", description: nil, addonName: "A")))
     }
 }
+
+final class HomeStreamAddonAutoHideTests: XCTestCase {
+    private var suiteName = ""
+    private var store: UserDefaults!
+
+    override func setUp() {
+        super.setUp()
+        suiteName = "HomeStreamAddonAutoHideTests.\(UUID().uuidString)"
+        store = UserDefaults(suiteName: suiteName)
+    }
+
+    override func tearDown() {
+        store.removePersistentDomain(forName: suiteName)
+        super.tearDown()
+    }
+
+    func testStreamAddonIsHiddenWhenMetadataAddonSuppliesRows() {
+        XCTAssertTrue(TVHomeCatalogOrder.autoHideStreamAddonIfNeeded(
+            addonID: "aio", servesStreams: true, metadataOnlyAddonInstalled: true, in: store))
+        XCTAssertEqual(TVHomeCatalogOrder.homeHiddenAddonIDs(in: store), ["aio"])
+        XCTAssertFalse(TVHomeCatalogOrder.autoHideStreamAddonIfNeeded(
+            addonID: "aio", servesStreams: true, metadataOnlyAddonInstalled: true, in: store))
+    }
+
+    func testStreamAddonKeepsRowsWithoutAMetadataAddon() {
+        XCTAssertFalse(TVHomeCatalogOrder.autoHideStreamAddonIfNeeded(
+            addonID: "aio", servesStreams: true, metadataOnlyAddonInstalled: false, in: store))
+        XCTAssertTrue(TVHomeCatalogOrder.homeHiddenAddonIDs(in: store).isEmpty)
+    }
+
+    func testMetadataAddonIsNeverHidden() {
+        XCTAssertFalse(TVHomeCatalogOrder.autoHideStreamAddonIfNeeded(
+            addonID: "aiom", servesStreams: false, metadataOnlyAddonInstalled: true, in: store))
+        XCTAssertTrue(TVHomeCatalogOrder.homeHiddenAddonIDs(in: store).isEmpty)
+    }
+
+    func testExplicitShowSurvivesLaterLoadsAndHideClearsIt() {
+        TVHomeCatalogOrder.setHomeHidden(false, addonID: "aio", in: store)
+        XCTAssertFalse(TVHomeCatalogOrder.autoHideStreamAddonIfNeeded(
+            addonID: "aio", servesStreams: true, metadataOnlyAddonInstalled: true, in: store))
+        XCTAssertTrue(TVHomeCatalogOrder.homeHiddenAddonIDs(in: store).isEmpty)
+
+        TVHomeCatalogOrder.setHomeHidden(true, addonID: "aio", in: store)
+        TVHomeCatalogOrder.setHomeHidden(false, addonID: "aio", in: store)
+        TVHomeCatalogOrder.setHomeHidden(true, addonID: "aio", in: store)
+        store.removeObject(forKey: SettingsKey.homeHiddenAddonIDs)
+        XCTAssertTrue(TVHomeCatalogOrder.autoHideStreamAddonIfNeeded(
+            addonID: "aio", servesStreams: true, metadataOnlyAddonInstalled: true, in: store))
+    }
+}
