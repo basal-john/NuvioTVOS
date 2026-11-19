@@ -6376,15 +6376,23 @@ struct TVHomeView: View {
             // When fullscreenHeroBackdrop is true: full bleed backdrop across entire screen.
             // When fullscreenHeroBackdrop is false: contained top-right hero art with soft dissolve masks.
             let backdropColor = Color.nuvioBackground(amoled: amoled, body: bodyColor)
+            let resolvedBackdropURL = showsLoading || homeLayout == "Grid View" ? nil : homeBackdropURL
+            let cropBackdropTop = focusedCollectionFolder != nil
+                && TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: resolvedBackdropURL)
             GeometryReader { proxy in
                 if fullscreenHeroBackdrop {
                     CrossfadingBackdrop(
-                        url: showsLoading || homeLayout == "Grid View" ? nil : homeBackdropURL,
+                        url: resolvedBackdropURL,
                         placeholder: backdropColor,
                         alignment: focusedCollectionFolder != nil ? .topTrailing : .center
                     )
                     .equatable()
-                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .frame(
+                        width: proxy.size.width,
+                        height: cropBackdropTop ? (proxy.size.height * 1.48).rounded() : proxy.size.height,
+                        alignment: .topTrailing
+                    )
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topTrailing)
                     .clipped()
                 } else {
                     let backdropWidth = proxy.size.width * 0.65
@@ -6394,12 +6402,18 @@ struct TVHomeView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                         CrossfadingBackdrop(
-                            url: showsLoading || homeLayout == "Grid View" ? nil : homeBackdropURL,
+                            url: resolvedBackdropURL,
                             placeholder: backdropColor,
                             alignment: .topTrailing
                         )
                         .equatable()
+                        .frame(
+                            width: backdropWidth,
+                            height: cropBackdropTop ? (backdropHeight * 1.48).rounded() : backdropHeight,
+                            alignment: .topTrailing
+                        )
                         .frame(width: backdropWidth, height: backdropHeight, alignment: .topTrailing)
+                        .clipped()
                         .mask(
                             LinearGradient(
                                 stops: [
@@ -13303,21 +13317,22 @@ private struct TVCollectionFolderHeroView: View, Equatable {
                 if let logoURL = folder.preferredTitleLogoURLString {
                     CachedHeroLogo(url: logoURL, title: displayTitle)
                 } else {
-                    HStack(alignment: .center, spacing: 18) {
+                    HStack(alignment: .center, spacing: 12) {
                         if let emoji {
                             Text(emoji)
-                                .font(.system(size: 52))
-                        } else {
-                            Image(systemName: "movieclapper")
-                                .font(.system(size: 44, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.92))
+                                .font(.system(size: homeLayout == "Compact" ? 28 : 32))
+                        } else if let symbolName = TVCollectionFolderCardLayout.editorialSymbolName(for: folder) {
+                            Image(systemName: symbolName)
+                                .font(.system(size: homeLayout == "Compact" ? 22 : 26, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.88))
                         }
 
                         Text(displayTitle)
-                            .font(.appFont(size: 48, weight: .bold))
-                            .foregroundColor(.white)
+                            .font(.appFont(size: homeLayout == "Compact" ? 28 : 34, weight: .semibold))
+                            .tracking(-0.3)
+                            .foregroundColor(.white.opacity(0.92))
                             .lineLimit(2)
-                            .minimumScaleFactor(0.7)
+                            .minimumScaleFactor(0.75)
                     }
                 }
             }

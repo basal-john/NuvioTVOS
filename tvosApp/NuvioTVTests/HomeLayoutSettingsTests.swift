@@ -1727,17 +1727,17 @@ final class HomeLayoutSettingsTests: XCTestCase {
     }
 
     func testTVCollectionFolderEditorialUnifiedSizingAndArtworkSelection() throws {
-        // Unified compact editorial dimensions for collection folder rows
-        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardHeight(layoutMode: "Modern"), 132)
-        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardHeight(layoutMode: "Compact"), 116)
-        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .landscape, layoutMode: "Modern"), 276)
-        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .square, layoutMode: "Modern"), 276)
+        // Unified editorial 16:9 dimensions matching poster visual weight (~1.03x)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardHeight(layoutMode: "Modern"), 196)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardHeight(layoutMode: "Compact"), 161)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .landscape, layoutMode: "Modern"), 348)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .square, layoutMode: "Modern"), 348)
         XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .poster, layoutMode: "Modern"), 210)
-        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .landscape, layoutMode: "Compact"), 242)
-        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .square, layoutMode: "Compact"), 242)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .landscape, layoutMode: "Compact"), 286)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .square, layoutMode: "Compact"), 286)
         XCTAssertEqual(TVCollectionFolderCardLayout.folderCardWidth(shape: .poster, layoutMode: "Compact"), 170)
-        XCTAssertEqual(TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: "Modern"), 24)
-        XCTAssertEqual(TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: "Compact"), 20)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: "Modern"), 26)
+        XCTAssertEqual(TVCollectionFolderCardLayout.folderRowSpacing(layoutMode: "Compact"), 22)
 
         let watchlistJSON = """
         {
@@ -1790,15 +1790,21 @@ final class HomeLayoutSettingsTests: XCTestCase {
             sources: []
         )
 
-        // Scroll offset uses unified 276pt width + 24pt spacing
+        // Scroll offset uses unified 348pt width + 26pt spacing
         XCTAssertEqual(
             TVCollectionFolderCardLayout.folderScrollOffset(
                 to: 2,
                 folders: [watchlistFolder, moodFolder, tmdbGenreFolder],
                 layoutMode: "Modern"
             ),
-            600
+            748
         )
+
+        // Hero backdrop top-crop detection strips lower-third baked text only on strand focus assets
+        XCTAssertTrue(TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: moodFolder.heroBackdropUrl))
+        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: watchlistFolder.heroBackdropUrl))
+        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: tmdbGenreFolder.heroBackdropUrl))
+        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: nil))
 
         // Watchlist prefers clean textless streaming-art backdrop without top-crop
         let watchlistArt = TVCollectionFolderCardLayout.editorialArtwork(for: watchlistFolder)

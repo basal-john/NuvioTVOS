@@ -1561,25 +1561,36 @@ enum TVCollectionFolderCardLayout {
         return offset
     }
 
-    /// Unified editorial glass strip height for Home collection folder rows
-    /// (Watchlist, Moods & Vibes, Genres, streaming hubs) so discovery shelves
-    /// stay subordinate to 210×315 poster rows instead of stretching to 560×315.
+    /// Unified editorial glass dimensions for Home collection folder rows
+    /// (Watchlist, Moods & Vibes, Genres, streaming hubs): 348×196 (16:9) matches
+    /// the visual area of 210×315 portrait posters (~1.03×) and fits 5 cards across
+    /// without ballooning to 560×315 or shrinking to tiny strips under the hero.
     static func folderCardHeight(layoutMode: String) -> CGFloat {
-        layoutMode == "Compact" ? 116 : 132
+        layoutMode == "Compact" ? 161 : 196
     }
 
     static func folderCardWidth(shape: CollectionTileShape, layoutMode: String) -> CGFloat {
         let compact = layoutMode == "Compact"
         switch shape {
         case .landscape, .square:
-            return compact ? 242 : 276
+            return compact ? 286 : 348
         case .poster:
             return compact ? 170 : 210
         }
     }
 
     static func folderRowSpacing(layoutMode: String) -> CGFloat {
-        layoutMode == "Compact" ? 20 : 24
+        layoutMode == "Compact" ? 22 : 26
+    }
+
+    /// True when a folder's hero backdrop URL carries baked-in lower-third
+    /// banner text (such as `strand-backgrounds/focus/` assets) that should be
+    /// cropped above the bottom 32% when rendered in the Modern Home hero.
+    static func heroBackdropNeedsTopCrop(url: String?) -> Bool {
+        guard let raw = url?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return false
+        }
+        return raw.lowercased().contains("strand-backgrounds/focus/")
     }
 
     static func folderScrollOffset(
@@ -2018,8 +2029,7 @@ struct TVCollectionFolderCard: View {
     }
 
     private var cardCornerRadius: CGFloat {
-        let base = AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
-        return base == 16 ? 14 : base
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
     }
 
     private var cardShape: RoundedRectangle {
@@ -2212,8 +2222,8 @@ struct TVCollectionFolderCard: View {
                         switch phase {
                         case .success(let image):
                             if artwork.cropTopFocal {
-                                let scaledWidth = (cardWidth * 1.25).rounded()
-                                let scaledHeight = (scaledWidth * 9.0 / 16.0).rounded()
+                                let scaledHeight = (cardHeight / 0.675).rounded()
+                                let scaledWidth = max(cardWidth, (scaledHeight * 16.0 / 9.0).rounded())
                                 image
                                     .resizable()
                                     .aspectRatio(contentMode: .fill)
@@ -2265,22 +2275,22 @@ struct TVCollectionFolderCard: View {
             )
             .allowsHitTesting(false)
 
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
                 if let symbolName = editorialSymbolName {
                     Image(systemName: symbolName)
-                        .font(.system(size: layoutMode == "Compact" ? 14 : 15, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.92))
+                        .font(.system(size: layoutMode == "Compact" ? 13 : 14, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.90))
                 }
                 Text(displayTitle)
-                    .font(.system(size: layoutMode == "Compact" ? 18 : 20, weight: .semibold))
-                    .tracking(-0.3)
-                    .foregroundColor(.white)
+                    .font(.system(size: layoutMode == "Compact" ? 16 : 18, weight: .semibold))
+                    .tracking(-0.2)
+                    .foregroundColor(.white.opacity(0.95))
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
             .shadow(color: .black.opacity(0.70), radius: 6, y: 1)
             .padding(.horizontal, 16)
-            .padding(.bottom, 13)
+            .padding(.bottom, 14)
         }
         .frame(width: cardWidth, height: cardHeight)
         .clipped()
