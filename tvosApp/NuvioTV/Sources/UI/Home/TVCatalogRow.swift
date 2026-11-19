@@ -1583,14 +1583,65 @@ enum TVCollectionFolderCardLayout {
         layoutMode == "Compact" ? 22 : 26
     }
 
-    /// True when a folder's hero backdrop URL carries baked-in lower-third
-    /// banner text (such as `strand-backgrounds/focus/` assets) that should be
-    /// cropped above the bottom 32% when rendered in the Modern Home hero.
-    static func heroBackdropNeedsTopCrop(url: String?) -> Bool {
+    /// True when a folder's hero backdrop URL is a banner asset that already
+    /// embeds its own title/subtitle (such as `strand-backgrounds/focus/`,
+    /// `strand-backgrounds/icons/`, or `streaming-art/covers/`). Home renders
+    /// these edge-to-edge without stacking a duplicate hero title on top.
+    static func heroBackdropHasEmbeddedTitle(url: String?) -> Bool {
         guard let raw = url?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return false
         }
-        return raw.lowercased().contains("strand-backgrounds/focus/")
+        let lower = raw.lowercased()
+        return lower.contains("strand-backgrounds/focus/")
+            || lower.contains("strand-backgrounds/icons/")
+            || lower.contains("streaming-art/main/covers/")
+            || lower.contains("streaming-art/covers/")
+    }
+
+    /// Suppresses the row section heading when a collection row contains a
+    /// single folder whose title duplicates the section heading (e.g. a
+    /// single-card Watchlist row).
+    static func shouldShowSectionTitle(title: String, folders: [TVCollectionFolderItem]) -> Bool {
+        guard folders.count == 1 else { return true }
+        let sectionName = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folderName = folders[0].title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sectionName.isEmpty, !folderName.isEmpty else { return true }
+        return sectionName.caseInsensitiveCompare(folderName) != .orderedSame
+    }
+
+    /// Quiet uppercase subtitle shown under textless Strand-style folder heroes
+    /// (such as Watchlist or TMDB genre backdrops) without repeating the title.
+    static func editorialHeroSubtitle(for folder: TVCollectionFolderItem) -> String? {
+        let normalizedTitle = folder.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let hasMovies = folder.sources.contains {
+            let kind = ($0.mediaType ?? $0.type ?? "").lowercased()
+            return kind == "movie" || kind == "movies"
+        }
+        let hasSeries = folder.sources.contains {
+            let kind = ($0.mediaType ?? $0.type ?? "").lowercased()
+            return kind == "series" || kind == "tv" || kind == "show" || kind == "shows"
+        }
+
+        let mediaSummary: String?
+        switch (hasMovies, hasSeries) {
+        case (true, true): mediaSummary = "MOVIES & SERIES"
+        case (true, false): mediaSummary = "MOVIES"
+        case (false, true): mediaSummary = "SERIES"
+        case (false, false): mediaSummary = nil
+        }
+
+        if normalizedTitle.contains("watchlist") || normalizedTitle.contains("watch list") {
+            if let mediaSummary {
+                return "SAVED \(mediaSummary)"
+            }
+            return "SAVED MOVIES & SERIES"
+        }
+
+        let count = folder.sources.count
+        if let mediaSummary {
+            return count > 1 ? "\(mediaSummary) · \(count) CATALOGS" : mediaSummary
+        }
+        return count > 0 ? (count == 1 ? "1 CATALOG" : "\(count) CATALOGS") : nil
     }
 
     static func folderScrollOffset(
@@ -2256,20 +2307,27 @@ struct TVCollectionFolderCard: View {
 
             focusGifOverlay
 
-            // Cinema scrim + subtle top-left glass sheen for crisp 10ft legibility.
+            // Cinema scrim + subtle top-left glass sheen. When focused, the hero
+            // carries the name, so the card scrim softens to pure unobstructed art.
             LinearGradient(
-                stops: [
-                    .init(color: Color.black.opacity(0.08), location: 0.0),
-                    .init(color: Color.black.opacity(0.28), location: 0.45),
-                    .init(color: Color.black.opacity(0.88), location: 1.0)
-                ],
+                stops: showFocus
+                    ? [
+                        .init(color: Color.black.opacity(0.02), location: 0.0),
+                        .init(color: Color.black.opacity(0.10), location: 0.65),
+                        .init(color: Color.black.opacity(0.30), location: 1.0)
+                    ]
+                    : [
+                        .init(color: Color.black.opacity(0.06), location: 0.0),
+                        .init(color: Color.black.opacity(0.24), location: 0.48),
+                        .init(color: Color.black.opacity(0.86), location: 1.0)
+                    ],
                 startPoint: .top,
                 endPoint: .bottom
             )
             .allowsHitTesting(false)
 
             LinearGradient(
-                colors: [Color.white.opacity(showFocus ? 0.16 : 0.10), .clear],
+                colors: [Color.white.opacity(showFocus ? 0.14 : 0.10), .clear],
                 startPoint: .topLeading,
                 endPoint: .center
             )
@@ -2291,6 +2349,8 @@ struct TVCollectionFolderCard: View {
             .shadow(color: .black.opacity(0.70), radius: 6, y: 1)
             .padding(.horizontal, 16)
             .padding(.bottom, 14)
+            .opacity(showFocus ? 0 : 1)
+            .animation(smoothFocusAnimations ? .easeOut(duration: 0.18) : nil, value: showFocus)
         }
         .frame(width: cardWidth, height: cardHeight)
         .clipped()

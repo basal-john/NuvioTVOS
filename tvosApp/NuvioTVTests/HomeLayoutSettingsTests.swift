@@ -1800,11 +1800,22 @@ final class HomeLayoutSettingsTests: XCTestCase {
             748
         )
 
-        // Hero backdrop top-crop detection strips lower-third baked text only on strand focus assets
-        XCTAssertTrue(TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: moodFolder.heroBackdropUrl))
-        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: watchlistFolder.heroBackdropUrl))
-        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: tmdbGenreFolder.heroBackdropUrl))
-        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: nil))
+        // Hero embedded-title banner detection avoids stacking duplicate hero titles
+        XCTAssertTrue(TVCollectionFolderCardLayout.heroBackdropHasEmbeddedTitle(url: moodFolder.heroBackdropUrl))
+        XCTAssertTrue(TVCollectionFolderCardLayout.heroBackdropHasEmbeddedTitle(url: watchlistFolder.coverImageUrl))
+        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropHasEmbeddedTitle(url: watchlistFolder.heroBackdropUrl))
+        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropHasEmbeddedTitle(url: tmdbGenreFolder.heroBackdropUrl))
+        XCTAssertFalse(TVCollectionFolderCardLayout.heroBackdropHasEmbeddedTitle(url: nil))
+
+        // Single-folder rows whose heading matches their card hide the duplicate row title
+        XCTAssertFalse(TVCollectionFolderCardLayout.shouldShowSectionTitle(title: "Watchlist", folders: [watchlistFolder]))
+        XCTAssertFalse(TVCollectionFolderCardLayout.shouldShowSectionTitle(title: "watchlist ", folders: [watchlistFolder]))
+        XCTAssertTrue(TVCollectionFolderCardLayout.shouldShowSectionTitle(title: "Quick Access", folders: [watchlistFolder]))
+        XCTAssertTrue(TVCollectionFolderCardLayout.shouldShowSectionTitle(title: "Moods & Vibes", folders: [moodFolder, tmdbGenreFolder]))
+
+        // Hero subtitle uses clean metadata without repeating folder/row names
+        XCTAssertEqual(TVCollectionFolderCardLayout.editorialHeroSubtitle(for: watchlistFolder), "SAVED MOVIES & SERIES")
+        XCTAssertNil(TVCollectionFolderCardLayout.editorialHeroSubtitle(for: moodFolder))
 
         // Watchlist prefers clean textless streaming-art backdrop without top-crop
         let watchlistArt = TVCollectionFolderCardLayout.editorialArtwork(for: watchlistFolder)

@@ -6377,22 +6377,55 @@ struct TVHomeView: View {
             // When fullscreenHeroBackdrop is false: contained top-right hero art with soft dissolve masks.
             let backdropColor = Color.nuvioBackground(amoled: amoled, body: bodyColor)
             let resolvedBackdropURL = showsLoading || homeLayout == "Grid View" ? nil : homeBackdropURL
-            let cropBackdropTop = focusedCollectionFolder != nil
-                && TVCollectionFolderCardLayout.heroBackdropNeedsTopCrop(url: resolvedBackdropURL)
+            let isCollectionHero = focusedCollectionFolder != nil && homeLayout != "Grid View" && !showsLoading
+            let hasEmbeddedHeroBanner = isCollectionHero
+                && TVCollectionFolderCardLayout.heroBackdropHasEmbeddedTitle(url: resolvedBackdropURL)
             GeometryReader { proxy in
-                if fullscreenHeroBackdrop {
+                if isCollectionHero {
+                    // Strand-style full-width 1920pt panoramic hero for collection
+                    // folders with a clean bottom-only fade into OLED black.
+                    let strandHeroHeight: CGFloat = homeLayout == "Compact" ? 430 : 552
+                    ZStack(alignment: .top) {
+                        backdropColor
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        CrossfadingBackdrop(
+                            url: resolvedBackdropURL,
+                            placeholder: backdropColor,
+                            alignment: hasEmbeddedHeroBanner ? .bottomLeading : .center
+                        )
+                        .equatable()
+                        .frame(width: proxy.size.width, height: strandHeroHeight, alignment: .top)
+                        .clipped()
+                        .mask(
+                            LinearGradient(
+                                stops: hasEmbeddedHeroBanner
+                                    ? [
+                                        .init(color: .black, location: 0.0),
+                                        .init(color: .black, location: 0.88),
+                                        .init(color: .black.opacity(0.48), location: 0.95),
+                                        .init(color: .clear, location: 1.0)
+                                    ]
+                                    : [
+                                        .init(color: .black, location: 0.0),
+                                        .init(color: .black, location: 0.72),
+                                        .init(color: .black.opacity(0.45), location: 0.88),
+                                        .init(color: .clear, location: 1.0)
+                                    ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                } else if fullscreenHeroBackdrop {
                     CrossfadingBackdrop(
                         url: resolvedBackdropURL,
                         placeholder: backdropColor,
-                        alignment: focusedCollectionFolder != nil ? .topTrailing : .center
+                        alignment: .center
                     )
                     .equatable()
-                    .frame(
-                        width: proxy.size.width,
-                        height: cropBackdropTop ? (proxy.size.height * 1.48).rounded() : proxy.size.height,
-                        alignment: .topTrailing
-                    )
-                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topTrailing)
+                    .frame(width: proxy.size.width, height: proxy.size.height)
                     .clipped()
                 } else {
                     let backdropWidth = proxy.size.width * 0.65
@@ -6407,13 +6440,7 @@ struct TVHomeView: View {
                             alignment: .topTrailing
                         )
                         .equatable()
-                        .frame(
-                            width: backdropWidth,
-                            height: cropBackdropTop ? (backdropHeight * 1.48).rounded() : backdropHeight,
-                            alignment: .topTrailing
-                        )
                         .frame(width: backdropWidth, height: backdropHeight, alignment: .topTrailing)
-                        .clipped()
                         .mask(
                             LinearGradient(
                                 stops: [
@@ -6446,7 +6473,7 @@ struct TVHomeView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             
             // 2. Gradients overlay for backdrop blending and readability (Fullscreen mode)
-            if fullscreenHeroBackdrop {
+            if fullscreenHeroBackdrop && !isCollectionHero {
                 GeometryReader { proxy in
                     LinearGradient(
                         stops: [
@@ -7464,7 +7491,10 @@ struct TVHomeView: View {
                             TVCollectionFolderRow(
                                 id: section.id,
                                 title: section.title,
-                                showsSectionTitle: true,
+                                showsSectionTitle: TVCollectionFolderCardLayout.shouldShowSectionTitle(
+                                    title: section.title,
+                                    folders: section.collectionFolders
+                                ),
                                 horizontalEdgeInset: heroBleed,
                                 folders: section.collectionFolders,
                                 initialScrollIndex: rowScrollStore.index(for: section.id),
@@ -8819,7 +8849,10 @@ struct TVHomeView: View {
             TVCollectionFolderRow(
                 id: section.id,
                 title: section.title,
-                showsSectionTitle: true,
+                showsSectionTitle: TVCollectionFolderCardLayout.shouldShowSectionTitle(
+                    title: section.title,
+                    folders: section.collectionFolders
+                ),
                 horizontalEdgeInset: horizontalEdgeInset,
                 folders: section.collectionFolders,
                 initialScrollIndex: rowScrollStore.index(for: section.id),
@@ -9283,15 +9316,19 @@ struct TVHomeView: View {
     }
 
     /// Collection folder row estimate. Editorial tiles render their title inside
-    /// the compact glass frame, so only logo-based rows ever reserve below-card
-    /// label space when poster labels are enabled globally.
+    /// the compact glass frame, and single-folder rows whose title duplicates the
+    /// section heading suppress the row header.
     private func estimatedCollectionRowHeight(for section: TVHomeSection) -> CGFloat {
         let imageHeight = TVCollectionFolderCardLayout.folderCardHeight(layoutMode: homeLayout)
         let showsLabels = posterLabels && section.collectionFolders.contains {
             TVCollectionFolderCardLayout.usesLogoCoverPresentation(for: $0) && !$0.hideTitle
         }
+        let showsHeading = TVCollectionFolderCardLayout.shouldShowSectionTitle(
+            title: section.title,
+            folders: section.collectionFolders
+        )
         let stripHeight = imageHeight + (showsLabels ? 48 : 0) + TVHomeLayout.stripVerticalPadding * 2
-        return stripHeight + TVHomeLayout.rowTitleBlock
+        return stripHeight + (showsHeading ? TVHomeLayout.rowTitleBlock : 0)
     }
 
     private func estimatedHeight(for section: TVHomeSection) -> CGFloat {
@@ -13292,7 +13329,9 @@ private struct TVCollectionFolderHeroView: View, Equatable {
         lhs.folder.id == rhs.folder.id &&
         lhs.folder.title == rhs.folder.title &&
         lhs.folder.coverEmoji == rhs.folder.coverEmoji &&
-        lhs.folder.preferredTitleLogoURLString == rhs.folder.preferredTitleLogoURLString
+        lhs.folder.preferredTitleLogoURLString == rhs.folder.preferredTitleLogoURLString &&
+        lhs.folder.preferredHeroBackdropURLString == rhs.folder.preferredHeroBackdropURLString &&
+        lhs.folder.sources == rhs.folder.sources
     }
 
     private var emoji: String? {
@@ -13308,38 +13347,51 @@ private struct TVCollectionFolderHeroView: View, Equatable {
         homeLayout == "Compact" ? 390 : 500
     }
 
+    private var hasEmbeddedBannerTitle: Bool {
+        TVCollectionFolderCardLayout.heroBackdropHasEmbeddedTitle(url: folder.preferredHeroBackdropURLString)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Push the title line to the bottom of the fixed hero frame.
             Spacer(minLength: 0)
 
-            Group {
-                if let logoURL = folder.preferredTitleLogoURLString {
-                    CachedHeroLogo(url: logoURL, title: displayTitle)
-                } else {
-                    HStack(alignment: .center, spacing: 12) {
-                        if let emoji {
-                            Text(emoji)
-                                .font(.system(size: homeLayout == "Compact" ? 28 : 32))
-                        } else if let symbolName = TVCollectionFolderCardLayout.editorialSymbolName(for: folder) {
-                            Image(systemName: symbolName)
-                                .font(.system(size: homeLayout == "Compact" ? 22 : 26, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.88))
-                        }
+            if !hasEmbeddedBannerTitle {
+                Group {
+                    if let logoURL = folder.preferredTitleLogoURLString {
+                        CachedHeroLogo(url: logoURL, title: displayTitle)
+                    } else {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .center, spacing: 14) {
+                                if let emoji {
+                                    Text(emoji)
+                                        .font(.system(size: homeLayout == "Compact" ? 32 : 40))
+                                }
 
-                        Text(displayTitle)
-                            .font(.appFont(size: homeLayout == "Compact" ? 28 : 34, weight: .semibold))
-                            .tracking(-0.3)
-                            .foregroundColor(.white.opacity(0.92))
-                            .lineLimit(2)
-                            .minimumScaleFactor(0.75)
+                                Text(displayTitle.uppercased())
+                                    .font(.appFont(size: homeLayout == "Compact" ? 38 : 48, weight: .heavy))
+                                    .tracking(-0.5)
+                                    .foregroundColor(.white)
+                                    .lineLimit(2)
+                                    .minimumScaleFactor(0.72)
+                                    .shadow(color: .black.opacity(0.65), radius: 14, y: 2)
+                            }
+
+                            if let subtitle = TVCollectionFolderCardLayout.editorialHeroSubtitle(for: folder) {
+                                Text(subtitle)
+                                    .font(.appFont(size: homeLayout == "Compact" ? 15 : 17, weight: .semibold))
+                                    .tracking(1.2)
+                                    .foregroundColor(.white.opacity(0.80))
+                                    .shadow(color: .black.opacity(0.75), radius: 8, y: 1)
+                            }
+                        }
                     }
                 }
+                .padding(.leading, TVLayout.rowLeading)
+                // Match the gap under poster-hero descriptions so the first catalog
+                // title sits the same distance below (Android-style).
+                .padding(.bottom, TVHomeLayout.heroBottomPadding)
             }
-            .padding(.leading, TVLayout.rowLeading)
-            // Match the gap under poster-hero descriptions so the first catalog
-            // title sits the same distance below (Android-style).
-            .padding(.bottom, TVHomeLayout.heroBottomPadding)
         }
         .foregroundColor(.white)
         .frame(maxWidth: .infinity, alignment: .leading)
