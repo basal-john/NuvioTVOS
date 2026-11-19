@@ -71,9 +71,11 @@ struct PlayerPanelRow: View {
     let title: String
     var subtitle: String?
     var trailing: String?
+    var statusBadge: String? = nil
     var selected: Bool = false
     var isFocused: Bool = false
     var emphasizesSelection: Bool = false
+    var showsActiveBorder: Bool = false
 
     private var filled: Bool { isFocused || (emphasizesSelection && selected) }
     private var ink: Color { filled ? .playerGlassInk : .white }
@@ -87,11 +89,30 @@ struct PlayerPanelRow: View {
     var body: some View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(ink)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 9) {
+                    Text(title)
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(ink)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let statusBadge, !statusBadge.isEmpty {
+                        Text(statusBadge.uppercased())
+                            .font(.system(size: 12, weight: .bold))
+                            .tracking(0.6)
+                            .foregroundStyle(filled ? Color.playerGlassInk : Color(red: 134 / 255, green: 239 / 255, blue: 172 / 255))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule().fill(filled ? Color.black.opacity(0.12) : Color(red: 74 / 255, green: 222 / 255, blue: 128 / 255).opacity(0.20))
+                            )
+                            .overlay {
+                                if !filled {
+                                    Capsule().strokeBorder(Color(red: 74 / 255, green: 222 / 255, blue: 128 / 255).opacity(0.38), lineWidth: 1)
+                                }
+                            }
+                            .fixedSize()
+                    }
+                }
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
                         .font(.system(size: 18, weight: .medium))
@@ -124,7 +145,11 @@ struct PlayerPanelRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
-                .fill(filled ? Color.white : Color.white.opacity(0.07))
+                .fill(filled ? Color.white : (showsActiveBorder && selected ? Color.white.opacity(0.14) : Color.white.opacity(0.07)))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
+                .strokeBorder(showsActiveBorder && selected && !filled ? Color.white.opacity(0.42) : .clear, lineWidth: 1.5)
         )
         .scaleEffect(isFocused ? 1.02 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
@@ -509,8 +534,10 @@ struct PlayerSourcesPanel: View {
                                         title: stream.panelTitle,
                                         subtitle: stream.panelSubtitle,
                                         trailing: stream.panelResolutionLabel,
+                                        statusBadge: selected ? "Playing" : nil,
                                         selected: selected,
-                                        isFocused: focusedID == stream.id
+                                        isFocused: focusedID == stream.id,
+                                        showsActiveBorder: true
                                     )
                                 }
                                 .buttonStyle(PosterCardButtonStyle())

@@ -92,18 +92,19 @@ final class SceneNavigationTests: XCTestCase {
         XCTAssertFalse(viewModel.moveSuppressed, "Swipe up from timeline to transport buttons must not suppress move commands")
     }
 
-    func testTouchpadSwipeDownFromTimelineOpensScene() {
+    func testTouchpadSwipeDownFromTimelineDoesNotOpenScene() {
         let viewModel = PlayerViewModel()
         viewModel.status = .playing
         viewModel.showControls = true
         viewModel.isTimelineFocused = true
+        XCTAssertTrue(viewModel.isSceneEnabled)
         XCTAssertFalse(viewModel.showScenePanel)
 
         viewModel.remoteTouchBegan()
         viewModel.remoteTouchMoved(dx: 0, dy: 35) // Downward swipe from timeline
 
-        XCTAssertTrue(viewModel.showScenePanel, "Swipe down from timeline must open Scene panel")
-        XCTAssertFalse(viewModel.showControls, "Controls must be hidden when Scene panel opens")
+        XCTAssertFalse(viewModel.showScenePanel, "Swipe down from timeline must not open Scene panel")
+        XCTAssertTrue(viewModel.showControls, "Controls stay visible when swiping down on timeline")
         XCTAssertTrue(viewModel.moveSuppressed)
 
         viewModel.remoteTouchEnded(dx: 0, dy: 35)

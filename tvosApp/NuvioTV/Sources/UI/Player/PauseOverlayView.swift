@@ -49,7 +49,8 @@ struct PlayerTelemetry: Equatable {
 
     init(
         info: ScenePlaybackInfo = ScenePlaybackInfo(), filename: String? = nil, streamTitle: String? = nil,
-        fileSize: Int64? = nil, bufferedAhead: Double? = nil, dialogueEnhanced: Bool = false, nightMode: Bool = false
+        fileSize: Int64? = nil, fallbackFileSizeText: String? = nil, bufferedAhead: Double? = nil,
+        dialogueEnhanced: Bool = false, nightMode: Bool = false
     ) {
         resolutionBadge = PlayerResolutionBadge(info.resolution)
         rangeBadge = PlayerDynamicRangeBadge(info)
@@ -101,7 +102,7 @@ struct PlayerTelemetry: Equatable {
         audioValue = spatial ?? channels ?? language
         self.fileSize = fileSize.flatMap {
             $0 > 0 ? ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) : nil
-        }
+        } ?? Self.value(fallbackFileSizeText)
         bitrate = Self.value(info.videoBitrate)
         buffer = bufferedAhead.flatMap {
             $0.isFinite ? $0.formatted(.number.precision(.fractionLength(1))) + " s ahead" : nil
@@ -125,6 +126,29 @@ struct PlayerTelemetry: Equatable {
         guard let code = value(raw), code.caseInsensitiveCompare("und") != .orderedSame else { return nil }
         let language = Locale.Language(identifier: code)
         return language.languageCode?.identifier.uppercased()
+    }
+
+    /// Extracts a human-readable file size token (e.g. `20.7 GB`) from stream metadata text
+    /// when structured `behaviorHints.videoSize` bytes are not supplied by the add-on.
+    static func parseFileSize(from raw: String?) -> String? {
+        guard let text = value(raw) else { return nil }
+        let pattern = #"(?i)(?<![A-Za-z0-9.])(\d+(?:[.,]\d+)?)\s*(TiB|GiB|MiB|TB|GB|MB)(?![A-Za-z0-9])"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let numberRange = Range(match.range(at: 1), in: text),
+              let unitRange = Range(match.range(at: 2), in: text) else {
+            return nil
+        }
+        let number = text[numberRange].replacingOccurrences(of: ",", with: ".")
+        let unitRaw = text[unitRange].uppercased()
+        let unit: String
+        switch unitRaw {
+        case "TIB": unit = "TB"
+        case "GIB": unit = "GB"
+        case "MIB": unit = "MB"
+        default: unit = unitRaw
+        }
+        return "\(number) \(unit)"
     }
 
     private static func value(_ raw: String?) -> String? {
@@ -171,28 +195,28 @@ struct PlayerTelemetryBar: View {
         let quality = [telemetry.resolutionBadge?.rawValue, telemetry.rangeBadge?.rawValue].compactMap { $0 }
         let audio = [telemetry.channelBadge?.rawValue, telemetry.audioBadge?.rawValue].compactMap { $0 }
 
-        HStack(alignment: .top, spacing: 25) {
+        HStack(alignment: .center, spacing: 25) {
             if !quality.isEmpty || telemetry.videoBadge != nil || !audio.isEmpty || telemetry.fileSize != nil {
-                HStack(spacing: 12) {
+                HStack(spacing: 9) {
                     if !quality.isEmpty {
-                        HStack(spacing: 8) {
-                            ForEach(quality, id: \.self) { PlayerBadgeImage(asset: $0) }
+                        HStack(spacing: 5) {
+                            ForEach(quality, id: \.self) { PlayerBadgeImage(asset: $0, height: 13) }
                         }
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 6)
+                        .padding(.horizontal, 8)
+                        .frame(height: 24)
                         .foregroundStyle(Color.playerGlassInk)
                         .background(.white, in: Capsule())
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel(telemetry.quality ?? "")
                     }
                     if let codec = telemetry.videoBadge {
-                        PlayerBadgeImage(asset: codec.rawValue)
+                        PlayerBadgeImage(asset: codec.rawValue, height: 13)
                             .accessibilityLabel(codec.rawValue.uppercased())
                     }
                     if !audio.isEmpty {
                         if !quality.isEmpty || telemetry.videoBadge != nil { divider }
-                        HStack(spacing: 10) {
-                            ForEach(audio, id: \.self) { PlayerBadgeImage(asset: $0) }
+                        HStack(spacing: 7) {
+                            ForEach(audio, id: \.self) { PlayerBadgeImage(asset: $0, height: 13) }
                         }
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel(telemetry.audio ?? "")
@@ -202,9 +226,10 @@ struct PlayerTelemetryBar: View {
                         Text(size)
                     }
                 }
-                .font(.system(size: 17, weight: .medium))
-                .padding(.horizontal, 11)
-                .padding(.vertical, 7)
+                .font(.system(size: 15, weight: .medium))
+                .padding(.leading, quality.isEmpty ? 12 : 7)
+                .padding(.trailing, 12)
+                .frame(height: 38)
                 .modifier(PlayerGlassSurface(shape: Capsule()))
                 .accessibilityElement(children: .combine)
             }
@@ -221,7 +246,7 @@ struct PlayerTelemetryBar: View {
         .foregroundStyle(.white)
     }
     private var divider: some View {
-        Rectangle().fill(.white.opacity(0.22)).frame(width: 1, height: 19)
+        Rectangle().fill(.white.opacity(0.22)).frame(width: 1, height: 14)
             .accessibilityHidden(true)
     }
 }

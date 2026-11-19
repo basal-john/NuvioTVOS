@@ -66,14 +66,78 @@ final class PlayerMediaBadgeTests: XCTestCase {
         XCTAssertNil(missing.fileSize)
     }
 
-    private func telemetry(engine: String, codec: String?, channels: Int?, spatial: String?) -> PlayerTelemetry {
-        let audio = PlayerViewModel.sceneAudioPresentation(
-            debug: PlaybackDebugInfo(audioSourceCodec: codec, audioSourceChannels: channels, audioSpatialFormat: spatial),
-            legacyDetails: nil
+    func testParseFileSizeExtractsHumanReadableSizeFromStreamMetadata() {
+        XCTAssertEqual(
+            PlayerTelemetry.parseFileSize(from: "M&Ms | TweakApps · WEB-DL · 2160p · 10bit · DD+ 5.1 · Kitsune · 20.7 GB"),
+            "20.7 GB"
         )
-        return PlayerTelemetry(info: ScenePlaybackInfo(
-            engine: engine, videoCodec: "AV01", resolution: "3840 × 2160", dynamicRange: "HDR10+",
-            audioCodec: audio.codec, audioChannels: audio.channels, audioSpatialFormat: audio.spatialFormat
-        ), filename: "Show.2160p.Atmos.71.mkv")
+        XCTAssertEqual(PlayerTelemetry.parseFileSize(from: "Remux · 4,52 GiB · Atmos"), "4.52 GB")
+        XCTAssertEqual(PlayerTelemetry.parseFileSize(from: "720p · 850MB"), "850 MB")
+        XCTAssertNil(PlayerTelemetry.parseFileSize(from: "WEB-DL · 2160p · DD+ 5.1"))
+
+        let withFallback = PlayerTelemetry(fileSize: nil, fallbackFileSizeText: "20.7 GB")
+        XCTAssertEqual(withFallback.fileSize, "20.7 GB")
     }
+
+    func testBestMatchingSourceIDHandlesRotatedResolveURLsAndQueryTokens() {
+        let kitsune = NuvioStream(
+            url: "https://aio.example.com/resolve/fresh-token-1/stream",
+            name: "Gentle Monster (2026) · AIO",
+            description: "M&Ms | TweakApps · WEB-DL · 2160p · 10bit · DD+ 5.1 · Kitsune · 20.7 GB",
+            addonName: "AIO",
+            filename: "Gentle.Monster.2026.2160p.WEB-DL.DDP5.1.H.265-Kitsune.mkv"
+        )
+        let playWeb = NuvioStream(
+            url: "https://aio.example.com/resolve/fresh-token-2/stream",
+            name: "Gentle Monster (2026) · AIO",
+            description: "M&Ms | TweakApps · WEB-DL · 2160p · DD+ 5.1 · playWEB · 22.4 GB",
+            addonName: "AIO",
+            filename: "Gentle.Monster.2026.2160p.WEB-DL.DDP5.1.H.265-playWEB.mkv"
+        )
+        let jellyfin = NuvioStream(
+            url: "https://jf.example.com/Videos/abc123/stream?Static=true&PlaySessionId=new-session",
+            name: "AioFin",
+            description: "4K SDR",
+            addonName: "Jellyfin"
+        )
+
+        // Rotated AIOStreams resolve token falls back cleanly to exact filename match.
+        let matchedAIO = PlayerViewModel.bestMatchingSourceID(
+            in: [kitsune, playWeb],
+            activeSourceID: "https://aio.example.com/resolve/stale-token-999/stream",
+            activeStreamURL: "https://cdn.torbox.app/dl/abc/Gentle.Monster.2026.2160p.WEB-DL.DDP5.1.H.265-Kitsune.mkv",
+            activeFilename: "Gentle.Monster.2026.2160p.WEB-DL.DDP5.1.H.265-Kitsune.mkv",
+            activeVideoHash: nil,
+            activeVideoSize: nil,
+            activeCacheFileIdentity: nil
+        )
+        XCTAssertEqual(matchedAIO, kitsune.id)
+
+        // Volatile Jellyfin PlaySessionId query param still matches the normalized URL path.
+        let matchedJF = PlayerViewModel.bestMatchingSourceID(
+            in: [kitsune, jellyfin],
+            activeSourceID: nil,
+            activeStreamURL: "https://jf.example.com/Videos/abc123/stream?Static=true&PlaySessionId=old-session",
+            activeFilename: nil,
+            activeVideoHash: nil,
+            activeVideoSize: nil,
+            activeCacheFileIdentity: nil
+        )
+        XCTAssertEqual(matchedJF, jellyfin.id)
+    }
+
+    func testSwipeDownWhileControlsVisibleDoesNotOpenSceneInfo() {
+        let vm = PlayerViewModel()
+        vm.status = .playing
+        vm.showControls = true
+        vm.showScenePanel = false
+        XCTAssertTrue(vm.isSceneEnabled)
+
+        vm.remoteTouchBegan()
+        vm.remoteTouchMoved(dx: 0, dy: 40)
+
+        XCTAssertFalse(vm.showScenePanel)
+        XCTAssertTrue(vm.showControls)
+    }
+
 }

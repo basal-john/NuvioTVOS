@@ -418,8 +418,6 @@ struct PlayerControls: View {
                 if didReportPlaybackStarted {
                     moveFocus(to: .timeline)
                 }
-            } else if origin == .timeline, viewModel.isSceneEnabled {
-                viewModel.openScene()
             }
         case .left:
             if origin == .timeline, !viewModel.isLiveStream {
@@ -756,7 +754,7 @@ struct PlayerEstimatedFinishTime: View {
                         .font(.system(size: 19, weight: .medium))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
+                        .frame(height: 38)
                         .modifier(PlayerGlassSurface(shape: Capsule()))
                         .accessibilityLabel(label)
                 }
@@ -3650,8 +3648,8 @@ private struct PlayerDock: View {
             case .sources:
                 HStack(spacing: 9) {
                     tile("Cached Only", cachedOnly ? "On" : "Off", id: "sources-cached") { cachedOnly.toggle() }
-                    tileLabel("Playing Quality", viewModel.playerTelemetry.quality ?? "Unavailable")
-                    tileLabel("Playing Size", viewModel.playerTelemetry.fileSize ?? "Unavailable")
+                        .frame(width: 148)
+                    nowPlayingSourceCard
                 }
             case .tune:
                 HStack(spacing: 9) {
@@ -3865,6 +3863,45 @@ private struct PlayerDock: View {
         detail = nil
         if tab == .speed { tab = .tune }
         focus = activeHub.rawValue
+    }
+
+    /// Pinned active-file readout beside Cached Only in the Sources tab.
+    private var nowPlayingSourceCard: some View {
+        let playing = viewModel.activePlayingSourceSummary
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Color(red: 74 / 255, green: 222 / 255, blue: 128 / 255))
+                    .frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
+                Text("NOW PLAYING")
+                    .font(.system(size: 12, weight: .bold))
+                    .tracking(0.8)
+                    .foregroundStyle(.white.opacity(0.9))
+                Spacer(minLength: 8)
+                if let detail = playing.detail {
+                    Text(detail)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.72))
+                        .lineLimit(1)
+                }
+            }
+            Text(playing.label)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .frame(maxWidth: .infinity, minHeight: 62, alignment: .leading)
+        .padding(.horizontal, 13)
+        .padding(.vertical, 8)
+        .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.white.opacity(0.24), lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Now playing, \(playing.label)")
     }
 
     private func tile(_ title: String, _ value: String, id: String, action: @escaping () -> Void) -> some View {

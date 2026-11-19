@@ -6055,11 +6055,7 @@ class PlayerViewModel: ObservableObject {
                 } else if dy > 0 {
                     suppressMoveBriefly()
                     touchIntent = .consumed
-                    if isSceneEnabled {
-                        openScene()
-                    } else {
-                        revealControls()
-                    }
+                    revealControls()
                 }
             } else {
                 suppressMoveBriefly()
@@ -7781,6 +7777,7 @@ class PlayerViewModel: ObservableObject {
                 guard !Task.isCancelled,
                       self.sourcesLoadGeneration == generation else { return }
                 self.availableSources = streams
+                self.refreshPlayerTelemetry(force: true)
             }
         }
     }
@@ -7792,13 +7789,158 @@ class PlayerViewModel: ObservableObject {
         isLoadingSources = false
     }
 
-    func isCurrentSource(_ stream: NuvioStream) -> Bool {
-        if let activeSourceID, !activeSourceID.isEmpty { return stream.id == activeSourceID }
-        guard let active = activeStreamURL else { return false }
-        if let url = stream.directURL, !url.isEmpty {
-            return url == active
+    /// Resolves the single best-matching source ID in `streams` for the active playback session,
+    /// handling re-fetched resolve tokens, volatile query parameters, and explicit filename fallback
+    /// without falsely matching an unrelated resolved playback URL when `activeSourceID` is explicit.
+    static func bestMatchingSourceID(
+        in streams: [NuvioStream],
+        activeSourceID: String?,
+        activeStreamURL: String?,
+        activeFilename: String?,
+        activeVideoHash: String?,
+        activeVideoSize: Int64?,
+        activeCacheFileIdentity: PlaybackCacheFileIdentity?
+    ) -> String? {
+        let explicitSourceID = activeSourceID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasExplicitSourceID = explicitSourceID?.isEmpty == false
+
+        if let explicitSourceID, !explicitSourceID.isEmpty,
+           let exact = streams.first(where: { $0.id == explicitSourceID }) {
+            return exact.id
         }
-        return false
+        if !hasExplicitSourceID,
+           let activeStreamURL, !activeStreamURL.isEmpty,
+           let exactURL = streams.first(where: { $0.directURL == activeStreamURL }) {
+            return exactURL.id
+        }
+        if let activeVideoHash = activeVideoHash?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !activeVideoHash.isEmpty,
+           let hashMatch = streams.first(where: {
+               $0.videoHash?.caseInsensitiveCompare(activeVideoHash) == .orderedSame
+           }) {
+            return hashMatch.id
+        }
+        if let identity = activeCacheFileIdentity, !identity.infoHash.isEmpty,
+           let torrentMatch = streams.first(where: {
+               $0.effectiveInfoHash?.caseInsensitiveCompare(identity.infoHash) == .orderedSame
+                   && $0.effectiveFileIdx == identity.fileIndex
+           }) {
+            return torrentMatch.id
+        }
+        if let normalizedKey = normalizedSourceURLKey(hasExplicitSourceID ? explicitSourceID : activeStreamURL),
+           let urlMatch = streams.first(where: { normalizedSourceURLKey($0.directURL) == normalizedKey }) {
+            return urlMatch.id
+        }
+        let targetFilename = normalizedVideoFilename(activeFilename)
+            ?? (hasExplicitSourceID ? nil : normalizedVideoFilename(fromURLString: activeStreamURL))
+        if let targetFilename {
+            let filenameMatches = streams.filter { stream in
+                let candidate = normalizedVideoFilename(stream.filename)
+                    ?? normalizedVideoFilename(fromURLString: stream.directURL)
+                return candidate == targetFilename
+            }
+            if let activeVideoSize, activeVideoSize > 0,
+               let exactSize = filenameMatches.first(where: { $0.videoSize == activeVideoSize }) {
+                return exactSize.id
+            }
+            if let firstMatch = filenameMatches.first {
+                return firstMatch.id
+            }
+        }
+        return nil
+    }
+
+    private static func normalizedSourceURLKey(_ rawURL: String?) -> String? {
+        guard let rawURL, !rawURL.isEmpty,
+              let components = URLComponents(string: rawURL),
+              let host = components.host?.lowercased(), !host.isEmpty else { return nil }
+        let path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        guard !path.isEmpty else { return nil }
+        return "\(host)/\(path)"
+    }
+
+    private static func normalizedVideoFilename(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return nil }
+        let last = (trimmed as NSString).lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !last.isEmpty else { return nil }
+        return last.lowercased()
+    }
+
+    private static func normalizedVideoFilename(fromURLString rawURL: String?) -> String? {
+        guard let rawURL, let url = URL(string: rawURL) else { return nil }
+        let last = url.lastPathComponent.removingPercentEncoding ?? url.lastPathComponent
+        guard last.contains(".") else { return nil }
+        let ext = (last as NSString).pathExtension.lowercased()
+        let videoExtensions: Set<String> = ["mkv", "mp4", "avi", "mov", "webm", "ts", "m4v", "wmv", "iso", "img"]
+        guard videoExtensions.contains(ext) else { return nil }
+        return last.lowercased()
+    }
+
+    /// The stream in `availableSources` that corresponds to the active playback session, if any.
+    var matchedCurrentSource: NuvioStream? {
+        guard let matchedID = Self.bestMatchingSourceID(
+            in: availableSources,
+            activeSourceID: activeSourceID,
+            activeStreamURL: activeStreamURL,
+            activeFilename: activeFilename,
+            activeVideoHash: activeVideoHash,
+            activeVideoSize: activeVideoSize,
+            activeCacheFileIdentity: activeCacheFileIdentity
+        ) else { return nil }
+        return availableSources.first(where: { $0.id == matchedID })
+    }
+
+    /// Human-readable file label and compact metadata for the Sources dock's pinned Now Playing strip.
+    var activePlayingSourceSummary: (label: String, detail: String?) {
+        let matched = matchedCurrentSource
+        let label: String
+        if let filename = playingFilename, !filename.isEmpty {
+            label = filename
+        } else if let streamFilename = matched?.filename?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !streamFilename.isEmpty {
+            label = (streamFilename as NSString).lastPathComponent
+        } else if let streamDesc = matched?.description?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !streamDesc.isEmpty {
+            label = streamDesc.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? streamDesc
+        } else if let streamName = matched?.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !streamName.isEmpty {
+            label = streamName
+        } else if let addon = activeAddonName?.trimmingCharacters(in: .whitespacesAndNewlines), !addon.isEmpty {
+            label = addon
+        } else {
+            label = "Current stream"
+        }
+
+        let detail = PlayerTelemetry.join([
+            playerTelemetry.quality,
+            playerTelemetry.fileSize,
+            activeProviderName
+        ])
+        return (label, detail)
+    }
+
+    func isCurrentSource(_ stream: NuvioStream) -> Bool {
+        if let matchedID = Self.bestMatchingSourceID(
+            in: availableSources,
+            activeSourceID: activeSourceID,
+            activeStreamURL: activeStreamURL,
+            activeFilename: activeFilename,
+            activeVideoHash: activeVideoHash,
+            activeVideoSize: activeVideoSize,
+            activeCacheFileIdentity: activeCacheFileIdentity
+        ) {
+            return stream.id == matchedID
+        }
+        return Self.bestMatchingSourceID(
+            in: [stream],
+            activeSourceID: activeSourceID,
+            activeStreamURL: activeStreamURL,
+            activeFilename: activeFilename,
+            activeVideoHash: activeVideoHash,
+            activeVideoSize: activeVideoSize,
+            activeCacheFileIdentity: activeCacheFileIdentity
+        ) == stream.id
     }
 
     func selectSource(_ stream: NuvioStream) {
@@ -7813,6 +7955,7 @@ class PlayerViewModel: ObservableObject {
             return
         }
         if isCurrentSource(stream) {
+            closePlayerDock()
             closeSidePanel()
             return
         }
@@ -8123,11 +8266,15 @@ class PlayerViewModel: ObservableObject {
         }
         guard shouldRefreshChrome else { return }
         lastPlayerTelemetryUpdate = now
+        let matchedStream = matchedCurrentSource
+        let fallbackSizeText = PlayerTelemetry.parseFileSize(from: matchedStream?.description)
+            ?? PlayerTelemetry.parseFileSize(from: matchedStream?.name)
         let summary = PlayerTelemetry(
             info: info,
-            filename: playingFilename,
-            streamTitle: availableSources.first(where: { isCurrentSource($0) })?.name,
-            fileSize: activeVideoSize,
+            filename: playingFilename ?? matchedStream?.filename,
+            streamTitle: matchedStream?.name,
+            fileSize: activeVideoSize ?? matchedStream?.videoSize,
+            fallbackFileSizeText: fallbackSizeText,
             bufferedAhead: max(0, clock.buffered - clock.position),
             dialogueEnhanced: supportsAudioProcessing && enhanceDialogueMode != .off,
             nightMode: supportsAudioProcessing && isReduceLoudSoundsActive
