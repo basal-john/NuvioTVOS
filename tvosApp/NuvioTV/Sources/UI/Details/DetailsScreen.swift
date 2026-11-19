@@ -1095,13 +1095,13 @@ struct DetailsScreen: View {
             let available = displayed.filter { $0.unavailabilityReason == nil && !$0.isNotPlayable }
             let pool: [NuvioStream]
             if preserveAddonOrder {
-                pool = available
+                pool = SmartPlaybackSelector.preferringTorBox(available)
             } else {
                 // Filter out 0-res / ticket streams if valid streams exist
                 let valid = available.filter {
                     !SmartPlaybackSelector.isLowQualityOrTicketStream($0) && StreamPickerListBuilder.resolution(for: $0) >= 720
                 }
-                pool = valid.isEmpty ? available : valid
+                pool = SmartPlaybackSelector.preferringTorBox(valid.isEmpty ? available : valid)
             }
             let preferBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
             let reuseBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
@@ -1118,7 +1118,7 @@ struct DetailsScreen: View {
                     }
                     return false
                 }
-                candidateStream = matching ?? pool.first
+                candidateStream = SmartPlaybackSelector.fasterEquivalent(of: matching, in: pool, isSeries: meta.isSeries) ?? pool.first
             } else {
                 candidateStream = pool.first
             }
@@ -1523,12 +1523,12 @@ struct DetailsScreen: View {
                     let available = displayed.filter { $0.unavailabilityReason == nil && !$0.isNotPlayable }
                     let pool: [NuvioStream]
                     if preserveAddonOrder {
-                        pool = available
+                        pool = SmartPlaybackSelector.preferringTorBox(available)
                     } else {
                         let valid = available.filter {
                             !SmartPlaybackSelector.isLowQualityOrTicketStream($0) && StreamPickerListBuilder.resolution(for: $0) >= 720
                         }
-                        pool = valid.isEmpty ? available : valid
+                        pool = SmartPlaybackSelector.preferringTorBox(valid.isEmpty ? available : valid)
                     }
                     if (preferBingeGroup || reuseBingeGroup), let preferredTags, preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil {
                         let matching = pool.first { stream in
@@ -1543,7 +1543,7 @@ struct DetailsScreen: View {
                             }
                             return false
                         }
-                        candidateStream = matching ?? pool.first
+                        candidateStream = SmartPlaybackSelector.fasterEquivalent(of: matching, in: pool, isSeries: meta.isSeries) ?? pool.first
                     } else {
                         candidateStream = pool.first
                     }
@@ -3889,6 +3889,7 @@ enum SmartPlaybackSelector {
         let candidatePool = validCandidates.isEmpty ? candidates : validCandidates
 
         let preferHardware = ProfileSettings.current.object(forKey: SettingsKey.preferHardwareDecodedStreams) as? Bool ?? true
+        let preferTorBox = isTorBoxPreferred
 
         let ranked = candidatePool.map { index, stream -> (index: Int, stream: NuvioStream, score: Int) in
             let tags = StreamQualityTags.parse(stream: stream)
@@ -3919,7 +3920,8 @@ enum SmartPlaybackSelector {
             } else {
                 hardwareBoost = 0
             }
-            return (index, stream, subtitleScore + qualityScore + featureScore + resumeScore + cachedBoost + lowQualityPenalty + hardwareBoost)
+            let serviceBoost = preferTorBox && isTorBoxStream(stream) ? torBoxBoost : 0
+            return (index, stream, subtitleScore + qualityScore + featureScore + resumeScore + cachedBoost + lowQualityPenalty + hardwareBoost + serviceBoost)
         }
 
         return ranked.sorted { lhs, rhs in
@@ -4026,6 +4028,54 @@ enum SmartPlaybackSelector {
     static func inferredResolution(for stream: NuvioStream) -> Int {
         let text = metadataSearchText(for: stream)
         return StreamQualityTags.resolution(in: text)
+    }
+
+    /// Breaks ties inside one resolution and stays below the smallest gap
+    /// between two resolutions in `score(resolution:preference:)` (20,000), so
+    /// it never lifts a lower resolution. TorBox links redirect to TorBox's CDN,
+    /// while proxied debrid and Usenet links pay a slow round trip on every seek.
+    static let torBoxBoost = 15_000
+
+    static var isTorBoxPreferred: Bool {
+        ProfileSettings.current.object(forKey: SettingsKey.preferTorBoxStreams) as? Bool ?? true
+    }
+
+    /// Moves TorBox links ahead of other links inside each run of equal
+    /// resolution. Everything else keeps its order, including an add-on's own order.
+    static func preferringTorBox(_ pool: [NuvioStream]) -> [NuvioStream] {
+        guard isTorBoxPreferred else { return pool }
+        var bucket = -1
+        var previousResolution: Int?
+        let keyed = pool.enumerated().map { index, stream -> (bucket: Int, service: Int, index: Int, stream: NuvioStream) in
+            let resolution = StreamPickerListBuilder.resolution(for: stream)
+            if resolution != previousResolution {
+                bucket += 1
+                previousResolution = resolution
+            }
+            return (bucket, isTorBoxStream(stream) ? 0 : 1, index, stream)
+        }
+        return keyed.sorted {
+            ($0.bucket, $0.service, $0.index) < ($1.bucket, $1.service, $1.index)
+        }.map(\.stream)
+    }
+
+    /// For a movie, swaps a remembered release on another service for a TorBox
+    /// link of the same resolution. Series keep their binge group.
+    static func fasterEquivalent(of matched: NuvioStream?, in pool: [NuvioStream], isSeries: Bool) -> NuvioStream? {
+        guard let matched else { return nil }
+        guard isTorBoxPreferred, !isSeries, !isTorBoxStream(matched) else { return matched }
+        let resolution = StreamPickerListBuilder.resolution(for: matched)
+        return pool.first { isTorBoxStream($0) && StreamPickerListBuilder.resolution(for: $0) == resolution } ?? matched
+    }
+
+    /// True when the source names TorBox as its service, for example the
+    /// AIOStreams label `Title (2000) · TB` or a `[TB+]` tag.
+    static func isTorBoxStream(_ stream: NuvioStream) -> Bool {
+        let name = stream.name ?? ""
+        if name.range(of: #"(^|[\s·\[(|])TB(\+|[\s\])|⚡]|$)"#, options: .regularExpression) != nil {
+            return true
+        }
+        return metadataSearchText(for: stream).contains("torbox")
     }
 
     private static func metadataSearchText(for stream: NuvioStream) -> String {
