@@ -11788,6 +11788,36 @@ enum TVHomeCatalogOrder {
         } else {
             settings.set(ids.sorted(), forKey: SettingsKey.homeHiddenAddonIDs)
         }
+        var shown = Set(settings.stringArray(forKey: SettingsKey.homeShownAddonIDs) ?? [])
+        if hidden { shown.remove(addonID) } else { shown.insert(addonID) }
+        if shown.isEmpty {
+            settings.removeObject(forKey: SettingsKey.homeShownAddonIDs)
+        } else {
+            settings.set(shown.sorted(), forKey: SettingsKey.homeShownAddonIDs)
+        }
+    }
+
+    /// Keeps a stream add-on's catalogs off Home while a metadata-only add-on supplies the
+    /// rows, so the two never show the same lists twice. Runs on every Home load, so the
+    /// hide comes back after a reinstall or a settings reset. A stream add-on the viewer
+    /// showed again with `setHomeHidden(false, …)` is left alone.
+    /// - Returns: true when this call hid the add-on.
+    @discardableResult
+    static func autoHideStreamAddonIfNeeded(
+        addonID: String,
+        servesStreams: Bool,
+        metadataOnlyAddonInstalled: Bool,
+        in settings: UserDefaults = ProfileSettings.current
+    ) -> Bool {
+        guard servesStreams, metadataOnlyAddonInstalled,
+              !homeHiddenAddonIDs(in: settings).contains(addonID),
+              !(settings.stringArray(forKey: SettingsKey.homeShownAddonIDs) ?? []).contains(addonID) else {
+            return false
+        }
+        var ids = homeHiddenAddonIDs(in: settings)
+        ids.insert(addonID)
+        settings.set(ids.sorted(), forKey: SettingsKey.homeHiddenAddonIDs)
+        return true
     }
 
     static func disabledAddonNames() -> Set<String> {
