@@ -128,6 +128,7 @@ final class MPVSubtitleTranslationState: ObservableObject {
     ) async throws -> String
 
     @Published private(set) var sourceText = ""
+    @Published var dockPreviewText: String?
     @Published private(set) var translatedText: String?
     @Published private(set) var isTranslating = false
 
@@ -1055,7 +1056,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var audioSelectionGeneration: UInt64 = 0
     private var desiredAudioSelection: DesiredTrackSelection?
     let subtitleTranslationState = MPVSubtitleTranslationState()
-    private var isMPVSubtitleRendererHiddenForTranslation = false
+    private var isMPVSubtitleRendererHidden = false
+    private var isDockSubtitlePreviewEnabled = false
     private var playerControlsVisibleForSubtitles = false
     private var subtitleStyleViewportHeight: CGFloat = 0
 
@@ -1655,7 +1657,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         applyHTTPHeaders(pendingHTTPHeaders, isLiveStream: pendingIsLiveStream)
         pendingHTTPHeaders = [:]
         subtitleTranslationState.reset()
-        isMPVSubtitleRendererHiddenForTranslation = false
+        isMPVSubtitleRendererHidden = false
         setFlag("sub-visibility", true)
         lifecyclePositionMs = nil
         lifecycleDurationMs = nil
@@ -1958,40 +1960,17 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         var audio = selectedAudio.map {
             $0.detail.isEmpty ? $0.title : $0.detail
         } ?? "Unknown"
-        let audioDetailComponents = selectedAudio?.detail
-            .components(separatedBy: "|")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? []
-        let rawAudioCodec = getString("current-tracks/audio/codec")?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let audioSourceCodec = rawAudioCodec?.isEmpty == false ? rawAudioCodec : nil
-        let audioSourceChannels = audioDetailComponents
-            .first(where: { $0.localizedCaseInsensitiveContains("ch") })
-            .flatMap { component in
-                component.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }.first
-            }
-        let audioCodecProfile = getString("current-tracks/audio/codec-profile")
-        let profileEvidence = audioCodecProfile?.lowercased() ?? ""
-        let audioSpatialFormat: String?
-        if profileEvidence.contains("atmos") || profileEvidence.contains("joc") {
-            audioSpatialFormat = "Atmos"
-        } else if profileEvidence.contains("dts:x") {
-            audioSpatialFormat = "DTS:X"
-        } else {
-            audioSpatialFormat = nil
-        }
-        let atmosEvidence = [
-            audioCodecProfile,
-            getString("current-tracks/audio/codec-desc"),
-            getString("current-tracks/audio/title"),
-            selectedAudio?.title,
-            selectedAudio?.detail,
-        ]
-        .compactMap { $0 }
-        .joined(separator: " ")
-        .lowercased()
-        if (atmosEvidence.contains("atmos") || atmosEvidence.contains("joc")),
-           !audio.localizedCaseInsensitiveContains("Atmos") {
-            audio += " • Atmos"
+        let audioCodec = getString("current-tracks/audio/codec")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let audioProfile = getString("current-tracks/audio/codec-profile")
+        let audioDescription = getString("current-tracks/audio/codec-desc")
+        let audioSourceCodec = audioCodec == "dts"
+            ? Self.dtsSourceCodec(profile: audioProfile ?? audioDescription)
+            : audioCodec
+        let channelCount = getInt("current-tracks/audio/demux-channel-count")
+        let audioSourceChannels = channelCount > 0 ? channelCount : nil
+        let audioSpatialFormat = Self.audioSpatialFormat(profile: audioProfile, description: audioDescription)
+        if let audioSpatialFormat, !audio.localizedCaseInsensitiveContains(audioSpatialFormat) {
+            audio += " • \(audioSpatialFormat)"
         }
 
         let isDV = dvProfile > 0
@@ -2103,6 +2082,23 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     /// Actual profile parsed by FFmpeg from the selected HEVC track.
     var dolbyVisionProfile: Int {
         getInt("current-tracks/video/dolby-vision-profile")
+    }
+
+    /// Spatial extensions are signalled in either active-track codec metadata field.
+    static func audioSpatialFormat(profile: String?, description: String?) -> String? {
+        let evidence = [profile, description].compactMap { $0 }.joined(separator: " ").lowercased()
+        if evidence.contains("atmos") || evidence.contains("joc") { return "Atmos" }
+        if evidence.contains("dts:x") { return "DTS:X" }
+        return nil
+    }
+
+    /// Distinguishes DTS core, High Resolution, and Master Audio from live profile data.
+    static func dtsSourceCodec(profile: String?) -> String {
+        let evidence = profile?.lowercased() ?? ""
+        if evidence.contains("dts:x") { return "DTS:X" }
+        if evidence.contains("dts-hd ma") || evidence.contains("dts-hd-ma") || evidence.contains("master audio") { return "DTS-HD MA" }
+        if evidence.contains("dts-hd") || evidence.contains("high resolution") { return "DTS-HD" }
+        return "DTS"
     }
 
     private static func videoCodecLabel(_ codec: String) -> String {
@@ -2371,7 +2367,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         NotificationCenter.default.removeObserver(self)
         pendingURL = nil
         subtitleTranslationState.reset()
-        isMPVSubtitleRendererHiddenForTranslation = false
+        isMPVSubtitleRendererHidden = false
         pendingLoadConfiguration = nil
         resetStartupDisplayGateState(clearAnchor: true)
         clearDisplayCriteria()
@@ -2568,14 +2564,26 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         refreshSubtitleTranslation()
     }
 
+    /// Route readable MPV cues into the dock's SwiftUI preview while it is open.
+    func setDockSubtitlePreviewEnabled(_ enabled: Bool) {
+        guard isDockSubtitlePreviewEnabled != enabled else { return }
+        isDockSubtitlePreviewEnabled = enabled
+        if !enabled { subtitleTranslationState.dockPreviewText = nil }
+        refreshSubtitleTranslation()
+    }
+
     private func refreshSubtitleTranslation() {
         guard mpv != nil else { return }
-        subtitleTranslationState.update(sourceText: getString("sub-text") ?? "")
-        let shouldHideRenderer = subtitleTranslationState.shouldDisplayOverlay
-        guard shouldHideRenderer != isMPVSubtitleRendererHiddenForTranslation else { return }
-        isMPVSubtitleRendererHiddenForTranslation = shouldHideRenderer
-        // MPV continues decoding `sub-text` while invisible, so original text
-        // is immediately available in the host overlay until Gemini responds.
+        let sourceText = getString("sub-text") ?? ""
+        subtitleTranslationState.update(sourceText: sourceText)
+        let text = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dockText = isDockSubtitlePreviewEnabled && !text.isEmpty ? text : nil
+        if subtitleTranslationState.dockPreviewText != dockText {
+            subtitleTranslationState.dockPreviewText = dockText
+        }
+        let shouldHideRenderer = subtitleTranslationState.shouldDisplayOverlay || dockText != nil
+        guard shouldHideRenderer != isMPVSubtitleRendererHidden else { return }
+        isMPVSubtitleRendererHidden = shouldHideRenderer
         setFlag("sub-visibility", !shouldHideRenderer)
     }
 

@@ -29,16 +29,10 @@ extension PlayerView {
             && viewModel.sidePanel == nil
     }
 
+    /// A move finishing during the loading overlay's exit can still reveal the controls.
     private func handleLoadingOverlayMove(_ direction: MoveCommandDirection) {
-        switch direction {
-        case .up:
-            break
-        case .down:
-            if viewModel.isSceneEnabled && !isLoadingOverlayVisible {
-                viewModel.openScene()
-            }
-        default:
-            break
+        if direction == .down && !isLoadingOverlayVisible && !viewModel.showControls {
+            viewModel.revealControlsFromRemoteDown()
         }
     }
 

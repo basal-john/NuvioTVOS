@@ -13,11 +13,20 @@ enum PlayerSidePanel: Equatable {
 struct PlayerSidePanelChrome<Content: View>: View {
     let title: String
     var onExit: () -> Void = {}
+    var embedded = false
     @ViewBuilder var content: Content
 
     private let panelCornerRadius: CGFloat = 34
 
     var body: some View {
+        if embedded {
+            content
+        } else {
+            drawer
+        }
+    }
+
+    private var drawer: some View {
         HStack(spacing: 0) {
             // Nothing is drawn beside the panel: any scrim here is laid out
             // inside the safe area (the chrome only ignores the trailing edge),
@@ -64,6 +73,10 @@ struct PlayerPanelRow: View {
     var trailing: String?
     var selected: Bool = false
     var isFocused: Bool = false
+    var emphasizesSelection: Bool = false
+
+    private var filled: Bool { isFocused || (emphasizesSelection && selected) }
+    private var ink: Color { filled ? .playerGlassInk : .white }
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
 
@@ -76,13 +89,13 @@ struct PlayerPanelRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                     .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(isFocused ? .black : .white)
+                    .foregroundStyle(ink)
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
                         .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(isFocused ? .black.opacity(0.55) : .white.opacity(0.55))
+                        .foregroundStyle(ink.opacity(0.55))
                         .lineLimit(4)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -92,18 +105,18 @@ struct PlayerPanelRow: View {
             if let trailing, !trailing.isEmpty {
                 Text(trailing)
                     .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(isFocused ? .black.opacity(0.7) : .white.opacity(0.75))
+                    .foregroundStyle(ink.opacity(filled ? 0.7 : 0.75))
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
                     .background(
-                        Capsule().fill(isFocused ? Color.black.opacity(0.08) : Color.white.opacity(0.12))
+                        Capsule().fill(ink.opacity(filled ? 0.08 : 0.12))
                     )
                     .fixedSize()
             }
             if selected {
                 Image(systemName: "checkmark")
                     .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(isFocused ? .black : .white)
+                    .foregroundStyle(ink)
             }
         }
         .padding(.horizontal, 22)
@@ -111,7 +124,7 @@ struct PlayerPanelRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
-                .fill(isFocused ? Color.white : Color.white.opacity(0.07))
+                .fill(filled ? Color.white : Color.white.opacity(0.07))
         )
         .scaleEffect(isFocused ? 1.02 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
@@ -122,6 +135,7 @@ struct PlayerPanelRow: View {
 
 struct PlayerEpisodesPanel: View {
     @ObservedObject var viewModel: PlayerViewModel
+    var embedded = false
     @FocusState private var focusedID: String?
     @State private var revealableNextEpisodeKey: String?
     @State private var strictWatchedEpisodeKeys: Set<String> = []
@@ -151,7 +165,7 @@ struct PlayerEpisodesPanel: View {
 
     var body: some View {
         let revealableKey = self.revealableNextEpisodeKey
-        PlayerSidePanelChrome(title: "Episodes", onExit: { viewModel.closeSidePanel() }) {
+        PlayerSidePanelChrome(title: "Episodes", onExit: { viewModel.closeSidePanel() }, embedded: embedded) {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 12) {
@@ -196,7 +210,7 @@ struct PlayerEpisodesPanel: View {
                 .focusSection()
                 .onAppear {
                     if viewModel.isShufflingEpisodes {
-                        DispatchQueue.main.async { focusedID = Self.shuffleOffID }
+                        if !embedded { DispatchQueue.main.async { focusedID = Self.shuffleOffID } }
                     } else {
                         scrollToTarget(proxy: proxy)
                     }
@@ -317,11 +331,11 @@ struct PlayerEpisodesPanel: View {
     private func scrollToTarget(proxy: ScrollViewProxy) {
         guard let target = targetEpisodeId else { return }
         DispatchQueue.main.async {
-            focusedID = target
+            if !embedded { focusedID = target }
             proxy.scrollTo(target, anchor: .center)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            focusedID = target
+            if !embedded { focusedID = target }
             withAnimation(.easeInOut(duration: 0.15)) {
                 proxy.scrollTo(target, anchor: .center)
             }
@@ -404,6 +418,12 @@ struct PlayerEpisodesPanel: View {
 
 struct PlayerSourcesPanel: View {
     @ObservedObject var viewModel: PlayerViewModel
+    var embedded = false
+    var cachedOnly = false
+
+    private var filteredSources: [NuvioStream] {
+        cachedOnly ? viewModel.availableSources.filter { $0.isCached == true } : viewModel.availableSources
+    }
     @FocusState private var focusedID: String?
     @State private var visibleSourceLimit: Int = 20
     @State private var didSeedSourceFocus = false
@@ -414,24 +434,20 @@ struct PlayerSourcesPanel: View {
     }
 
     private var targetSourceId: String? {
-        if let current = viewModel.availableSources.first(where: { viewModel.isCurrentSource($0) }) {
+        if let current = filteredSources.first(where: { viewModel.isCurrentSource($0) }) {
             return current.id
         }
-        return viewModel.availableSources.first?.id
-    }
-
-    private var sourcesToShow: [NuvioStream] {
-        Array(viewModel.availableSources.prefix(visibleSourceLimit))
+        return filteredSources.first?.id
     }
 
     private func loadMoreSources() {
-        guard visibleSourceLimit < viewModel.availableSources.count else { return }
-        visibleSourceLimit = min(visibleSourceLimit + 20, viewModel.availableSources.count)
+        guard visibleSourceLimit < filteredSources.count else { return }
+        visibleSourceLimit = min(visibleSourceLimit + 20, filteredSources.count)
     }
 
     private func ensureTargetSourceVisible() {
         if let target = targetSourceId,
-           let index = viewModel.availableSources.firstIndex(where: { $0.id == target }) {
+           let index = filteredSources.firstIndex(where: { $0.id == target }) {
             if index >= visibleSourceLimit {
                 visibleSourceLimit = max(visibleSourceLimit, index + 10)
             }
@@ -439,11 +455,13 @@ struct PlayerSourcesPanel: View {
     }
 
     var body: some View {
-        let totalCount = viewModel.availableSources.count
+        let filteredSources = filteredSources
+        let sourcesToShow = Array(filteredSources.prefix(visibleSourceLimit))
+        let totalCount = filteredSources.count
         let displayedCount = sourcesToShow.count
         let hasMore = totalCount > displayedCount
 
-        PlayerSidePanelChrome(title: "Sources", onExit: { viewModel.closeSidePanel() }) {
+        PlayerSidePanelChrome(title: "Sources", onExit: { viewModel.closeSidePanel() }, embedded: embedded) {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 12) {
@@ -469,11 +487,11 @@ struct PlayerSourcesPanel: View {
                             .focusEffectDisabledIfAvailable()
                             .focused($focusedID, equals: "loading")
                             .id("loading")
-                        } else if viewModel.availableSources.isEmpty {
+                        } else if filteredSources.isEmpty {
                             Button {} label: {
                                 PlayerPanelRow(
                                     title: L10n.string("player_no_sources_found", fallback: "No sources found"),
-                                    subtitle: L10n.string("player_no_sources_found_subtitle", fallback: "None of your stream add-ons returned a link."),
+                                    subtitle: cachedOnly ? "No sources confirmed as cached." : L10n.string("player_no_sources_found_subtitle", fallback: "None of your stream add-ons returned a link."),
                                     isFocused: focusedID == "empty"
                                 )
                             }
@@ -543,12 +561,12 @@ struct PlayerSourcesPanel: View {
                 .onAppear {
                     didSeedSourceFocus = false
                     viewModel.loadSourcesIfNeeded()
-                    if sourcesToShow.isEmpty && viewModel.isLoadingSources {
+                    if !embedded, sourcesToShow.isEmpty && viewModel.isLoadingSources {
                         focusedID = "loading"
                     }
                     seedSourceFocus(proxy: proxy)
                 }
-                .onChange(of: viewModel.availableSources.map(\.id)) { _, sourceIDs in
+                .onChange(of: filteredSources.map(\.id)) { _, sourceIDs in
                     guard !sourceIDs.isEmpty else { return }
                     seedSourceFocus(proxy: proxy)
                 }
@@ -566,12 +584,12 @@ struct PlayerSourcesPanel: View {
     private func scrollToTarget(proxy: ScrollViewProxy) {
         guard let target = targetSourceId else { return }
         DispatchQueue.main.async {
-            focusedID = target
+            if !embedded { focusedID = target }
             proxy.scrollTo(target, anchor: .center)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             guard let target = targetSourceId else { return }
-            focusedID = target
+            if !embedded { focusedID = target }
             withAnimation(.easeInOut(duration: 0.15)) {
                 proxy.scrollTo(target, anchor: .center)
             }

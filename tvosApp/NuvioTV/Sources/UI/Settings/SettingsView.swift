@@ -11771,7 +11771,6 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.hybridDiskCacheEnabled) private var hybridDiskCacheEnabled = false
     @AppStorage(SettingsKey.hybridDiskCacheLimitGB) private var hybridDiskCacheLimitGB = 20
     @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Off"
-    @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
     @AppStorage(SettingsKey.playerShowSources) private var playerShowSources = true
     @AppStorage(SettingsKey.playerShowSubtitles) private var playerShowSubtitles = true
@@ -12661,7 +12660,6 @@ private struct PlaybackSettingsView: View {
             ) {
                 PlayerButtonsSettingsSection(
                     accentColor: accentColor,
-                    playerShowPiP: $playerShowPiP,
                     playerShowEpisodes: $playerShowEpisodes,
                     playerShowSources: $playerShowSources,
                     playerShowSubtitles: $playerShowSubtitles,
@@ -12689,13 +12687,13 @@ private struct PlaybackSettingsView: View {
     }
 
     private var visiblePlayerButtonCount: Int {
-        [playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed]
+        [playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed]
             .filter { $0 }
             .count
     }
 
     private func refreshInSightSectionsSummary() {
-        let count = TVSceneTabOrder.enabledTabCount()
+        let count = TVSceneTabOrder.enabledTabs().filter { $0 != .chapters }.count
         guard inSightSectionsEnabledCount != count else { return }
         inSightSectionsEnabledCount = count
     }
@@ -12722,22 +12720,21 @@ private struct PlaybackSettingsView: View {
 @MainActor
 private struct PlayerButtonsSettingsSection: View {
     let accentColor: Color
-    @Binding var playerShowPiP: Bool
     @Binding var playerShowEpisodes: Bool
     @Binding var playerShowSources: Bool
     @Binding var playerShowSubtitles: Bool
     @Binding var playerShowAudio: Bool
     @Binding var playerShowSpeed: Bool
 
-    @State private var buttons: [TVPlayerButton] = TVPlayerButtonOrder.currentOrder()
+    @State private var buttons: [TVPlayerButton] = TVPlayerButtonOrder.currentOrder().filter { $0 != .pip }
     @FocusState private var focusedButtonID: String?
 
     var body: some View {
         SettingsGroup(
             title: L10n.string("tvos_settings_player_transport_controls", fallback: "Transport Controls"),
             subtitle: L10n.string(
-                "tvos_settings_player_transport_controls_subtitle",
-                fallback: "Enable and order the PiP, Episodes, Sources, Subtitles, Audio, and Speed buttons."
+                "tvos_settings_player_buttons_manage_subtitle",
+                fallback: "Choose which player buttons appear and arrange their left-to-right order"
             )
         ) {
             SettingsActionRow(
@@ -12809,7 +12806,7 @@ private struct PlayerButtonsSettingsSection: View {
     }
 
     private func reload() {
-        let currentOrder = TVPlayerButtonOrder.currentOrder()
+        let currentOrder = TVPlayerButtonOrder.currentOrder().filter { $0 != .pip }
         guard buttons != currentOrder else { return }
         buttons = currentOrder
     }
@@ -12823,7 +12820,7 @@ private struct PlayerButtonsSettingsSection: View {
 
     private func isEnabled(_ button: TVPlayerButton) -> Bool {
         switch button {
-        case .pip: return playerShowPiP
+        case .pip: return false
         case .episodes: return playerShowEpisodes
         case .sources: return playerShowSources
         case .subtitles: return playerShowSubtitles
@@ -12834,7 +12831,7 @@ private struct PlayerButtonsSettingsSection: View {
 
     private func toggle(_ button: TVPlayerButton) {
         switch button {
-        case .pip: playerShowPiP.toggle()
+        case .pip: break
         case .episodes: playerShowEpisodes.toggle()
         case .sources: playerShowSources.toggle()
         case .subtitles: playerShowSubtitles.toggle()
@@ -12845,8 +12842,7 @@ private struct PlayerButtonsSettingsSection: View {
 
     private func subtitle(for button: TVPlayerButton) -> String {
         switch button {
-        case .pip:
-            return L10n.string("tvos_settings_player_pip_subtitle", fallback: "Show the Picture in Picture button in player controls")
+        case .pip: return ""
         case .episodes:
             return L10n.string("tvos_settings_player_episodes_subtitle", fallback: "Show the Episodes panel button when watching series")
         case .sources:
@@ -12861,7 +12857,6 @@ private struct PlayerButtonsSettingsSection: View {
     }
 
     private func reset() {
-        playerShowPiP = true
         playerShowEpisodes = true
         playerShowSources = true
         playerShowSubtitles = true
@@ -12877,7 +12872,7 @@ private struct InSightSectionsSettingsSection: View {
     let accentColor: Color
     @Binding var sceneFeatureEnabled: Bool
 
-    @State private var tabs: [SceneTab] = TVSceneTabOrder.currentOrder()
+    @State private var tabs: [SceneTab] = TVSceneTabOrder.currentOrder().filter { $0 != .chapters }
     @State private var disabledTabs: Set<SceneTab> = TVSceneTabOrder.disabledTabs()
     @FocusState private var focusedTabID: String?
 
@@ -12967,7 +12962,7 @@ private struct InSightSectionsSettingsSection: View {
     }
 
     private func reload() {
-        let currentOrder = TVSceneTabOrder.currentOrder()
+        let currentOrder = TVSceneTabOrder.currentOrder().filter { $0 != .chapters }
         if tabs != currentOrder {
             tabs = currentOrder
         }

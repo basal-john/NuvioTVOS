@@ -269,7 +269,8 @@ struct PlayerSubtitleOverlay: View {
 /// MPV decodes its active text subtitle through `sub-text`. When AI
 /// translation is active MPV's own renderer stays hidden, and this host layer
 /// immediately renders the original text until the translated replacement is
-/// available. Bitmap subtitles remain entirely under MPV's renderer.
+/// available. The player dock can also preview unmodified text here.
+/// Bitmap subtitles remain under MPV's renderer.
 struct MPVSubtitleOverlay: View {
     @ObservedObject var translation: MPVSubtitleTranslationState
     let videoNaturalSize: CGSize
@@ -294,7 +295,7 @@ struct MPVSubtitleOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            if let text = translation.displayText {
+            if let text = translation.displayText ?? translation.dockPreviewText {
                 let videoRect = displayedVideoRect(
                     container: geo.size,
                     video: videoNaturalSize,

@@ -268,10 +268,6 @@ class PlayerViewModel: ObservableObject {
     private var chapterThumbnailTask: Task<Void, Never>?
     private var chapterThumbnailToken: UInt64 = 0
     private var chapterThumbnailFocusIndex: Int?
-    /// The stills started loading on their own for this chapter list (see
-    /// `autoStartChapterThumbnailsIfReady`), and since when playback could let them.
-    private var chapterThumbnailsAutoStarted = false
-    private var chapterThumbnailsEligibleSince: Date?
     @Published var discTitles: [PlaybackDiscTitleInfo] = []
     @Published var selectedDiscTitleId: Int? = nil
     @Published var playbackSpeed: PlaybackSpeed = .normal
@@ -302,6 +298,7 @@ class PlayerViewModel: ObservableObject {
     @Published var showControls: Bool = false {
         didSet {
             if oldValue != showControls {
+                if !showControls && showPlayerDock { closePlayerDock() }
                 PlaybackTimelineRecorder.record(showControls ? .controlsShown : .controlsHidden, engine: activeEngineKind)
             }
         }
@@ -391,6 +388,14 @@ class PlayerViewModel: ObservableObject {
     }
     /// Active audio route name (e.g. HomePod, TV Speakers, AirPods).
     @Published var currentAudioRouteDescription: String = PlaybackSystemMonitor.currentAudioOutputTitle()
+    @Published private(set) var showPlayerDock = false
+    var initialPlayerSettingsTab: PlayerSettingsPanel.Tab = .subtitles
+    @Published private(set) var playerTelemetry = PlayerTelemetry()
+    private var lastPlayerTelemetryUpdate: CFTimeInterval = 0
+    private var lastSyncedAudioTrack: AudioTrack?
+
+    var playingFilename: String? { effectiveFilename.map { ($0 as NSString).lastPathComponent } }
+
     /// In-player side sheet (episodes / sources).
     @Published var sidePanel: PlayerSidePanel? = nil {
         didSet {
@@ -3062,6 +3067,9 @@ class PlayerViewModel: ObservableObject {
         )
         self.activeAddonName = prepared.addonName
         self.activeProviderName = prepared.provider
+        playerTelemetry = PlayerTelemetry()
+        lastPlayerTelemetryUpdate = 0
+        lastSyncedAudioTrack = nil
         self.activeFilename = prepared.filename
         self.activeVideoSize = prepared.videoSize
         self.activeVideoHash = prepared.videoHash
@@ -4170,12 +4178,7 @@ class PlayerViewModel: ObservableObject {
         }
 
         updatePlaybackDebugHUD(from: c)
-        if showScenePanel {
-            let scenePlaybackInfo = buildScenePlaybackInfo()
-            if sceneViewModel.playbackInfo != scenePlaybackInfo {
-                sceneViewModel.updatePlaybackInfo(scenePlaybackInfo)
-            }
-        }
+        refreshPlayerTelemetry()
 
         // The controls are shown on launch (showControls defaults to true) but the
         // auto-hide timer is only armed by user transport actions. Arm it whenever
@@ -4312,6 +4315,7 @@ class PlayerViewModel: ObservableObject {
         syncTracks()
     }
 
+    /// Synchronizes track choices and refreshes badges when the engine confirms a new active track.
     func syncTracks() {
         let c = engine
 
@@ -4321,13 +4325,17 @@ class PlayerViewModel: ObservableObject {
                        languageName: $0.languageName, detail: $0.detail)
         }
         if audioTracks != latestAudioTracks { audioTracks = latestAudioTracks }
+        let selectedAudio = latestAudioTracks.first(where: \.isSelected)
+        if lastSyncedAudioTrack != selectedAudio {
+            lastSyncedAudioTrack = selectedAudio
+            refreshPlayerTelemetry(force: true)
+        }
 
         let latestChapters = c.chapters
         if !PlaybackChapters.isSameList(chapters, latestChapters) {
             chapters = latestChapters
             chapterSkipIntervals = PlaybackChapters.skipIntervals(from: latestChapters)
         }
-        autoStartChapterThumbnailsIfReady()
 
         var subs = c.subtitleTracks.map { track in
             let externalSubtitle = availableExternalSubtitles.first {
@@ -4480,6 +4488,7 @@ class PlayerViewModel: ObservableObject {
             screensaverDebugLog("[ScreensaverDebug][PlayerVM] schedulePauseOverlay fired: showing pause overlay")
             self.showControls = false
             self.showPauseOverlay = true
+            self.refreshPlayerTelemetry(force: true)
             self.updateSkipIntervalState()
         }
     }
@@ -5041,8 +5050,6 @@ class PlayerViewModel: ObservableObject {
                 guard !self.isChaptersTabHidden else {
                     // Chapters switched off in Settings meanwhile: stop, and start again on
                     // their own if they are switched back on.
-                    self.chapterThumbnailsAutoStarted = false
-                    self.chapterThumbnailsEligibleSince = nil
                     self.publishChapterThumbnailStatus("off")
                     return
                 }
@@ -5092,31 +5099,6 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    /// Chapter stills load without the panel, so it opens with them: once playback has run
-    /// 10 s, and then only while paused or with a healthy buffer (the loader's own rule), not
-    /// while scrubbing. Not when seek previews are off or the Chapters tab is hidden.
-    private func autoStartChapterThumbnailsIfReady() {
-        guard !chapterThumbnailsAutoStarted, chapterThumbnailTask == nil, !chapters.isEmpty else { return }
-        guard status == .playing || status == .paused else {
-            chapterThumbnailsEligibleSince = nil
-            return
-        }
-        let now = Date()
-        guard let since = chapterThumbnailsEligibleSince else {
-            chapterThumbnailsEligibleSince = now
-            return
-        }
-        guard now.timeIntervalSince(since) >= Self.chapterThumbnailsAutoStartDelay,
-              canShowChapterThumbnails,
-              !self.isChaptersTabHidden,
-              !isScrubbing, !isHoldingSeek, pendingSeekDelta == 0,
-              chapterThumbnailsMayLoadInBackground else { return }
-        chapterThumbnailsAutoStarted = true
-        startChapterThumbnails()
-    }
-
-    static let chapterThumbnailsAutoStartDelay: TimeInterval = 10
-
     /// Chapters switched off (their section in InSight Sections, or InSight itself): no stills load.
     private var isChaptersTabHidden: Bool {
         !isSceneEnabled || TVSceneTabOrder.disabledTabs().contains(.chapters)
@@ -5148,8 +5130,6 @@ class PlayerViewModel: ObservableObject {
         chapterThumbnailTask?.cancel()
         chapterThumbnailTask = nil
         chapterThumbnailFocusIndex = nil
-        chapterThumbnailsAutoStarted = false
-        chapterThumbnailsEligibleSince = nil
         chapterThumbnails.reset()
         SeekPreviewDiagnostics.shared.updateChapters("")
     }
@@ -6068,7 +6048,7 @@ class PlayerViewModel: ObservableObject {
             let adx = abs(dx), ady = abs(dy)
             guard max(adx, ady) >= 15 else { return }
             if ady > adx {
-                if showPauseOverlay {
+                if showPauseOverlay || !showControls {
                     suppressMoveBriefly()
                     touchIntent = .consumed
                     revealControls()
@@ -6080,10 +6060,6 @@ class PlayerViewModel: ObservableObject {
                     } else {
                         revealControls()
                     }
-                } else if !showControls {
-                    suppressMoveBriefly()
-                    touchIntent = .consumed
-                    revealControls()
                 }
             } else {
                 suppressMoveBriefly()
@@ -7269,6 +7245,7 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
+    /// Selects an audio track and immediately resamples the active engine.
     func selectAudio(_ track: AudioTrack, persist: Bool = true) {
         PlaybackTimelineRecorder.record(.audioSelectionRequested, engine: activeEngineKind)
         if let id = Int(track.id) {
@@ -7276,6 +7253,7 @@ class PlayerViewModel: ObservableObject {
         }
         PlaybackTimelineRecorder.record(.audioSelectionReturned, engine: activeEngineKind)
         audioTracks = audioTracks.map { var t = $0; t.isSelected = (t.id == track.id); return t }
+        refreshPlayerTelemetry(force: true)
         if persist {
             saveAudioSelection(track)
             didApplySavedAudioSelection = true
@@ -7655,6 +7633,12 @@ class PlayerViewModel: ObservableObject {
         updateSkipIntervalState()
     }
 
+    /// Reveal the transport without letting the same directional event reach the new timeline focus.
+    func revealControlsFromRemoteDown() {
+        suppressMoveBriefly(0.25)
+        revealControls()
+    }
+
     func revealControls() {
         hidePeek()
         if isScrubbing || controlsAutoHideSuspended || showScenePanel || isSceneDetailVisible || isSwitchingSource || isReloadingStream || isAdvancingEpisode || isAwaitingStreamStart { return }
@@ -7665,6 +7649,7 @@ class PlayerViewModel: ObservableObject {
         showControls = true
         if wasHidden {
             isTimelineFocused = true
+            refreshPlayerTelemetry(force: true)
         }
         updateSkipIntervalState()
         if status == .playing {
@@ -7713,6 +7698,20 @@ class PlayerViewModel: ObservableObject {
             || WatchedStore.episodeWatchCount(meta: meta, season: episode.season, episode: episode.episode) > 0
     }
 
+    /// Keep the transport visible while the dock owns remote focus.
+    func openPlayerDock() {
+        showPlayerDock = true
+        clearNextEpisodeCard()
+        setControlsAutoHideSuspended(true)
+    }
+
+    /// Release focus and restore the standard hide timer when leaving the dock.
+    func closePlayerDock() {
+        guard showPlayerDock else { return }
+        showPlayerDock = false
+        setControlsAutoHideSuspended(false)
+    }
+
     func openSidePanel(_ panel: PlayerSidePanel) {
         cancelPauseOverlaySchedule()
         showPauseOverlay = false
@@ -7727,6 +7726,10 @@ class PlayerViewModel: ObservableObject {
     }
 
     func closeSidePanel() {
+        if showPlayerDock {
+            closePlayerDock()
+            return
+        }
         sidePanel = nil
         controlsAutoHideSuspended = false
         if isSwitchingSource || isReloadingStream || isAdvancingEpisode || isAwaitingStreamStart {
@@ -7957,25 +7960,12 @@ class PlayerViewModel: ObservableObject {
         engine.setAspectMode(mode)
     }
 
-    /// Published accessors for the pause overlay (meta is private).
-    var pauseOverlayLogoURL: URL? {
-        guard let raw = activeMeta?.logoUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else { return nil }
-        return URL(string: raw)
-    }
-
-    var pauseOverlayYear: Int? { activeMeta?.year }
-
     var pauseOverlayDescription: String? {
         // Prefer episode overview when we have one; fall back to title synopsis.
         if let overview = currentEpisodeVideo?.overview, !overview.isEmpty {
             return overview
         }
         return activeMeta?.description
-    }
-
-    var pauseOverlayCast: [String] {
-        activeMeta?.cast ?? []
     }
 
     var pauseOverlayEpisodeLine: String? {
@@ -8120,6 +8110,31 @@ class PlayerViewModel: ObservableObject {
         }
     }
     
+    /// Refresh visible telemetry once per second and bypass the throttle for track and control changes.
+    private func refreshPlayerTelemetry(force: Bool = false) {
+        guard force || showControls || showPlayerDock || isScrubbing || isHoldingSeek || pendingSeekDelta != 0
+                || showPauseOverlay || showScenePanel else { return }
+        let now = CACurrentMediaTime()
+        let shouldRefreshChrome = force || now - lastPlayerTelemetryUpdate >= 1
+        guard shouldRefreshChrome || showScenePanel else { return }
+        let info = buildScenePlaybackInfo()
+        if sceneViewModel.playbackInfo != info {
+            sceneViewModel.updatePlaybackInfo(info)
+        }
+        guard shouldRefreshChrome else { return }
+        lastPlayerTelemetryUpdate = now
+        let summary = PlayerTelemetry(
+            info: info,
+            filename: playingFilename,
+            streamTitle: availableSources.first(where: { isCurrentSource($0) })?.name,
+            fileSize: activeVideoSize,
+            bufferedAhead: max(0, clock.buffered - clock.position),
+            dialogueEnhanced: supportsAudioProcessing && enhanceDialogueMode != .off,
+            nightMode: supportsAudioProcessing && isReduceLoudSoundsActive
+        )
+        if playerTelemetry != summary { playerTelemetry = summary }
+    }
+
     func buildScenePlaybackInfo() -> ScenePlaybackInfo {
         let engineName: String
         let engineVer: String
@@ -8287,8 +8302,10 @@ class PlayerViewModel: ObservableObject {
             dynamicRange = "HDR10+"
         } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HLG") {
             dynamicRange = "HLG"
-        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR") {
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR10") || effectiveHDRRaw.localizedCaseInsensitiveContains("PQ") {
             dynamicRange = "HDR10"
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR") {
+            dynamicRange = "HDR"
         } else if effectiveHDRRaw.localizedCaseInsensitiveContains("SDR") {
             dynamicRange = "SDR"
         } else {
@@ -8411,7 +8428,7 @@ class PlayerViewModel: ObservableObject {
         } else if codecUpper.contains("DTS:X") {
             codec = "DTS:X"
         } else if codecUpper.contains("DTS-HD") {
-            codec = "DTS-HD MA"
+            codec = MPVPlayerViewController.dtsSourceCodec(profile: codecUpper)
         } else if codecUpper.contains("DTS") {
             codec = "DTS"
         } else if codecUpper.contains("AAC") {
@@ -8429,6 +8446,7 @@ class PlayerViewModel: ObservableObject {
             case 1: channels = "Mono (1ch)"
             case 2: channels = "Stereo (2.0ch)"
             case 6: channels = "Surround (5.1ch)"
+            case 7: channels = "Surround (6.1ch)"
             case 8: channels = "Surround (7.1ch)"
             default: channels = "Surround (\(count)ch)"
             }
@@ -8497,7 +8515,6 @@ class PlayerViewModel: ObservableObject {
             runtime: activeMeta?.runtime,
             nextEpisode: nextEpisode,
             playbackInfo: playbackInfo,
-            hasChapters: !chapters.isEmpty,
             hasAutoSync: !availableExternalSubtitles.isEmpty && !isLiveStream && !isTrailerPlaybackSession
         )
         sceneViewModel.open()

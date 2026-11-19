@@ -6,32 +6,31 @@ import SwiftUI
 @MainActor
 final class SceneNavigationTests: XCTestCase {
     
-    func testRemoteDownOpensSceneWithoutPauseOrSeek() {
-        let viewModel = PlayerViewModel()
-        viewModel.status = .playing
-        XCTAssertFalse(viewModel.showScenePanel)
-        
-        // Simulating remote Down when controls are hidden
-        viewModel.openScene()
-        
-        XCTAssertTrue(viewModel.showScenePanel)
-        XCTAssertEqual(viewModel.status, .playing, "Playback must not pause when Scene opens")
-        XCTAssertEqual(viewModel.sceneViewModel.selectedTab, .scene, "Scene tab must be selected initially")
-    }
-
-    func testTouchpadSwipeDownOpensSceneWhenControlsHidden() {
+    func testRemoteDownRevealsControlsWithoutPauseOrSeek() {
         let viewModel = PlayerViewModel()
         viewModel.status = .playing
         viewModel.showControls = false
+
+        viewModel.revealControlsFromRemoteDown()
+
+        XCTAssertTrue(viewModel.showControls)
+        XCTAssertTrue(viewModel.moveSuppressed, "The reveal press must be consumed before it reaches the timeline")
         XCTAssertFalse(viewModel.showScenePanel)
+        XCTAssertEqual(viewModel.status, .playing)
+    }
+
+    func testTouchpadSwipeDownRevealsControlsWhenHidden() {
+        let viewModel = PlayerViewModel()
+        viewModel.status = .playing
+        viewModel.showControls = false
 
         viewModel.remoteTouchBegan()
-        viewModel.remoteTouchMoved(dx: 0, dy: 35) // Downward swipe on touch surface
+        viewModel.remoteTouchMoved(dx: 0, dy: 35)
 
-        XCTAssertTrue(viewModel.showScenePanel, "Swipe down on remote touchpad must open Scene panel")
-        XCTAssertFalse(viewModel.showControls, "Swipe down on remote touchpad must not reveal transport controls")
-        XCTAssertTrue(viewModel.moveSuppressed, "Swipe down should briefly suppress move commands")
-        XCTAssertEqual(viewModel.status, .playing, "Playback must remain playing when Scene opens")
+        XCTAssertTrue(viewModel.showControls)
+        XCTAssertFalse(viewModel.showScenePanel)
+        XCTAssertTrue(viewModel.moveSuppressed)
+        XCTAssertEqual(viewModel.status, .playing)
 
         viewModel.remoteTouchEnded(dx: 0, dy: 35)
     }

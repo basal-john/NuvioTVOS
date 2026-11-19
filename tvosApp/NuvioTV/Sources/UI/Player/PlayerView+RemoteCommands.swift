@@ -44,6 +44,10 @@ extension PlayerView {
             viewModel.showSettingsPanel = false
             return
         }
+        if viewModel.showPlayerDock {
+            viewModel.closePlayerDock()
+            return
+        }
         if viewModel.sidePanel != nil {
             viewModel.closeSidePanel()
             return

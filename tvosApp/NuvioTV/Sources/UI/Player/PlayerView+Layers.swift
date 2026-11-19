@@ -25,6 +25,10 @@ extension PlayerView {
             && !isLoadingOverlayVisible
     }
 
+    var isDockSubtitlePreviewVisible: Bool {
+        viewModel.showPlayerDock && !viewModel.showSettingsPanel
+    }
+
     private var isPlayerBottomFadeVisible: Bool {
         arePlaybackControlsVisible || viewModel.showScenePanel || viewModel.isSceneDetailVisible
     }
@@ -133,7 +137,8 @@ extension PlayerView {
                     style: viewModel.subtitleStyle,
                     controlsVisible: arePlaybackControlsVisible
                 )
-                .offset(y: viewModel.showScenePanel ? -430 : 0)
+                .scaleEffect(isDockSubtitlePreviewVisible ? 0.58 : 1, anchor: .bottomLeading)
+                .offset(x: isDockSubtitlePreviewVisible ? 38 : 0, y: viewModel.showScenePanel ? -430 : 0)
                 .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
             } else {
                 MPVSubtitleOverlay(
@@ -143,7 +148,8 @@ extension PlayerView {
                     style: viewModel.subtitleStyle,
                     controlsVisible: arePlaybackControlsVisible
                 )
-                .offset(y: viewModel.showScenePanel ? -430 : 0)
+                .scaleEffect(isDockSubtitlePreviewVisible ? 0.58 : 1, anchor: .bottomLeading)
+                .offset(x: isDockSubtitlePreviewVisible ? 38 : 0, y: viewModel.showScenePanel ? -430 : 0)
                 .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
             }
 
@@ -318,33 +324,22 @@ extension PlayerView {
                 screensaverDebugLog("[ScreensaverDebug][Input] RemoteSeekPressCatcher onEnd: isWaking=\(isWakingFromBackground)")
                 viewModel.stopRepeatingSkip()
             },
-            canRevealControls: { canRevealControlsFromRemotePress },
-            canHandleUp: {
-                canRevealControlsFromRemotePress || canFocusTransportFromTimeline
-            },
+            canHandleUp: { canFocusTransportFromTimeline },
             onTapUp: {
-                if canRevealControlsFromRemotePress {
-                    viewModel.revealControls()
-                } else if canFocusTransportFromTimeline {
-                    if viewModel.showSkipSegmentCard {
-                        focusSkipSegment()
-                    } else {
-                        requestedControlFocus = .firstTransportButton
-                    }
+                if viewModel.showSkipSegmentCard {
+                    focusSkipSegment()
+                } else {
+                    requestedControlFocus = .firstTransportButton
                 }
             },
             canHandleDown: {
-                canOpenSceneFromTimeline || canOpenSceneWhenControlsHidden
+                canOpenSceneFromTimeline || canRevealControlsFromRemotePress
             },
             onTapDown: {
                 if canOpenSceneFromTimeline {
                     viewModel.openScene()
-                } else if canOpenSceneWhenControlsHidden {
-                    if viewModel.isSceneEnabled {
-                        viewModel.openScene()
-                    } else {
-                        viewModel.revealControls()
-                    }
+                } else if canRevealControlsFromRemotePress {
+                    viewModel.revealControlsFromRemoteDown()
                 }
             }
         )
@@ -366,14 +361,11 @@ extension PlayerView {
             && viewModel.isTimelineFocused
             && !viewModel.isScrubbing
             && !viewModel.isHoldingSeek
+            && !viewModel.moveSuppressed
             && viewModel.pendingSeekDelta == 0
             && !viewModel.controlsAutoHideSuspended
             && !isGestureCaptureActive
             && viewModel.isSceneEnabled
-    }
-
-    private var canOpenSceneWhenControlsHidden: Bool {
-        canRevealControlsFromRemotePress
     }
 
     private var canFocusTransportFromTimeline: Bool {
@@ -397,6 +389,7 @@ extension PlayerView {
     private var canRevealControlsFromRemotePress: Bool {
         !isGestureCaptureActive
             && !viewModel.showControls
+            && !viewModel.showPauseOverlay
             && !viewModel.showSettingsPanel
             && !viewModel.showScenePanel
             && !viewModel.isSceneDetailVisible
@@ -553,13 +546,9 @@ extension PlayerView {
                     // Discrete seeking is exclusively triggered by physical button / D-pad taps via RemoteSeekPressCatcher.
                     break
                 case .down:
-                    if viewModel.isSceneEnabled {
-                        viewModel.openScene()
-                    } else {
-                        viewModel.revealControls()
-                    }
+                    viewModel.revealControlsFromRemoteDown()
                 default:
-                    viewModel.revealControls()
+                    break
                 }
             }
             .accessibilityHidden(true)
@@ -603,32 +592,6 @@ extension PlayerView {
                     guard let room = watchPartyOwner?.service?.session, let party = room.party else { return "party.create" }
                     return party.hostMemberID == room.memberID ? "party.hostOnly" : "party.lobby"
                 }(),
-                chaptersContent: viewModel.chapters.isEmpty ? nil : { focus, focusContext in
-                    AnyView(PlayerChaptersRow(
-                        viewModel: viewModel,
-                        clock: viewModel.clock,
-                        thumbnails: viewModel.chapterThumbnails,
-                        focusedCardID: focus,
-                        focusContext: focusContext,
-                        onSelect: {
-                            withAnimation(.playerControls) {
-                                viewModel.closeScene()
-                                focusRemoteInput()
-                            }
-                        },
-                        onDismiss: {
-                            withAnimation(.playerControls) {
-                                viewModel.closeScene()
-                                focusRemoteInput()
-                            }
-                        }
-                    ))
-                },
-                chaptersFocusTarget: {
-                    let chapters = viewModel.chapters
-                    guard !chapters.isEmpty else { return "chapter-0" }
-                    return PlayerChaptersRow.focusID(of: chapters[viewModel.currentChapterIndex ?? 0])
-                }(),
                 autoSyncContent: viewModel.availableExternalSubtitles.isEmpty ? nil : { focus, focusContext in
                     AnyView(PlayerAutoSyncPanel(
                         viewModel: viewModel,
@@ -669,12 +632,21 @@ extension PlayerView {
         // Pause metadata sheet ("You're watching…").
         if viewModel.showPauseOverlay && viewModel.canShowPauseOverlay {
             PauseOverlayView(
-                title: viewModel.title,
-                episodeLine: viewModel.pauseOverlayEpisodeLine,
-                year: viewModel.pauseOverlayYear,
-                description: viewModel.pauseOverlayDescription,
-                cast: viewModel.pauseOverlayCast,
-                logoURL: viewModel.pauseOverlayLogoURL
+                viewModel: viewModel,
+                clock: viewModel.clock,
+                onResume: {
+                    guard !isWakingFromBackground else { return }
+                    viewModel.handleSelectTap(isOverlayFocused: true)
+                },
+                onMove: { direction in
+                    guard !isWakingFromBackground, !viewModel.moveSuppressed else { return }
+                    if direction == .down {
+                        viewModel.revealControlsFromRemoteDown()
+                    } else {
+                        viewModel.revealControls()
+                    }
+                },
+                onExit: handleRemoteBack
             )
             .transition(.opacity)
             .zIndex(2)
@@ -684,6 +656,7 @@ extension PlayerView {
     @ViewBuilder
     var skipSegmentLayer: some View {
         if viewModel.showSkipSegmentCard
+            && !viewModel.showPauseOverlay
             && !viewModel.postPlayState.isVisible
             && !viewModel.showSettingsPanel
             && !viewModel.showScenePanel
@@ -756,6 +729,7 @@ extension PlayerView {
         // Next-episode prompt, shown near the end. Auto-play occurs only
         // after the current episode reaches genuine end-of-media.
         if viewModel.showNextEpisodeCard
+            && !viewModel.showPauseOverlay
             && !viewModel.postPlayState.isVisible
             && !viewModel.showSettingsPanel
             && !viewModel.showScenePanel
@@ -919,7 +893,10 @@ extension PlayerView {
     var settingsPanelLayer: some View {
         // Settings panel (subtitles / audio / speed), over the dimmed video.
         if viewModel.showSettingsPanel {
-            PlayerSettingsPanel(viewModel: viewModel, didReportPlaybackStarted: didReportPlaybackStarted) {
+            PlayerSettingsPanel(
+                viewModel: viewModel, didReportPlaybackStarted: didReportPlaybackStarted,
+                initialTab: viewModel.initialPlayerSettingsTab
+            ) {
                 viewModel.showSettingsPanel = false
             }
             .transition(.opacity)

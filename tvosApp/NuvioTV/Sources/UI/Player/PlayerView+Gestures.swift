@@ -2,12 +2,13 @@ import SwiftUI
 
 /// Remote gestures during playback: while playing with the controls hidden, the
 /// gesture layer holds the remote. A bound gesture does its action; any other gesture does what
-/// the player does with it anyway (± seek, hold seek, pause, controls, InSight, peek).
+/// the player does with it anyway (± seek, hold seek, pause, controls, peek).
 extension PlayerView {
     /// When the focus sink owns the remote (controls hidden, nothing else up).
     var isFocusSinkEligible: Bool {
         didReportPlaybackStarted
             && (!viewModel.showControls || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
+            && !(viewModel.showPauseOverlay && viewModel.canShowPauseOverlay)
             && !viewModel.isScrubbing
             && !viewModel.isHoldingSeek
             && viewModel.currentErrorDiagnostic == nil
@@ -30,6 +31,7 @@ extension PlayerView {
             && !isLoadingOverlayVisible
             && PlayerGestureCaptureStatus.keepsCapture(viewModel.status)
             && !viewModel.showControls
+            && !viewModel.showPlayerDock
             && !viewModel.showPauseOverlay
             && !viewModel.isScrubbing
             && !viewModel.isSwitchingSource
@@ -154,12 +156,10 @@ extension PlayerView {
         case .playPause:
             viewModel.togglePlayPause()
         case .revealControls:
-            viewModel.revealControls()
-        case .openPanel:
-            if viewModel.isSceneEnabled {
-                viewModel.openScene()
-            } else {
+            if case .swipe(.up, _) = gesture {
                 viewModel.revealControls()
+            } else {
+                viewModel.revealControlsFromRemoteDown()
             }
         case .peek:
             viewModel.showPeek()

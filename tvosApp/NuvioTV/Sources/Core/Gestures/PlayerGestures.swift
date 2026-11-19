@@ -242,7 +242,7 @@ enum PlayerBuiltInGesture {
     case seekBack, seekForward
     case holdSeekBack, holdSeekForward
     case select, playPause
-    case revealControls, openPanel
+    case revealControls
     case peek
 
     static func action(for gesture: RemoteGesture) -> PlayerBuiltInGesture? {
@@ -253,8 +253,7 @@ enum PlayerBuiltInGesture {
         case .click(.right, .single): return .seekForward
         case .click(.left, .long): return .holdSeekBack
         case .click(.right, .long): return .holdSeekForward
-        case .click(.up, .single), .swipe(.up, _): return .revealControls
-        case .click(.down, .single), .swipe(.down, _): return .openPanel
+        case .click(.down, .single), .swipe(.down, _), .swipe(.up, _): return .revealControls
         case let .tap(side, double: false):
             switch side {
             case .left, .topLeft, .bottomLeft: return .seekBack
@@ -275,7 +274,6 @@ enum PlayerBuiltInGesture {
         case .select: return "pause"
         case .playPause: return "play / pause"
         case .revealControls: return "show controls"
-        case .openPanel: return "InSight"
         case .peek: return "peek"
         }
     }

@@ -5005,6 +5005,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         }
     }
 
+    /// Reports source codec and spatial format from the active demuxed track.
     static func audioSourceDiagnostics(
         for track: TrackInfo?,
         activeDecoder: String?,
@@ -5016,16 +5017,19 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let visiblePipeline = !isLoading && pipeline?.isEmpty == false ? pipeline : nil
         let pipelineEvidence = visiblePipeline?.lowercased() ?? ""
         let spatialFormat: String?
-        if track?.isAtmos == true || profile.contains("atmos") || profile.contains("joc")
-            || pipelineEvidence.contains("atmos") || pipelineEvidence.contains("joc") {
+        let codecName = codec?.lowercased()
+        let dolbySpatialCodec = codecName == "eac3" || codecName == "truehd"
+        if track?.isAtmos == true || track?.trueHDAtmos == .atmos || profile.contains("atmos") || profile.contains("joc")
+            || (dolbySpatialCodec && (pipelineEvidence.contains("atmos") || pipelineEvidence.contains("joc"))) {
             spatialFormat = "Atmos"
-        } else if profile.contains("dts:x") || pipelineEvidence.contains("dts:x") {
+        } else if track?.isDTSX == true || profile.contains("dts:x")
+            || (codecName == "dts" && pipelineEvidence.contains("dts:x")) {
             spatialFormat = "DTS:X"
         } else {
             spatialFormat = nil
         }
         return (
-            codec?.isEmpty == false ? codec : nil,
+            codecName == "dts" ? MPVPlayerViewController.dtsSourceCodec(profile: profile) : (codec?.isEmpty == false ? codec : nil),
             track.flatMap { $0.channels > 0 ? $0.channels : nil },
             spatialFormat,
             visiblePipeline

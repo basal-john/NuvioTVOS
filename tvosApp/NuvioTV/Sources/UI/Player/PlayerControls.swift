@@ -3,8 +3,8 @@ import AVKit
 import CoreGraphics
 
 enum PlayerControlFocus: Hashable {
-    case pip
     case episodes
+    case info
     case sources
     case subtitles
     case audio
@@ -15,9 +15,9 @@ enum PlayerControlFocus: Hashable {
 }
 
 private extension TVPlayerButton {
-    var focusKey: PlayerControlFocus {
+    var focusKey: PlayerControlFocus? {
         switch self {
-        case .pip: return .pip
+        case .pip: return nil
         case .episodes: return .episodes
         case .sources: return .sources
         case .subtitles: return .subtitles
@@ -40,11 +40,9 @@ struct PlayerControls: View {
     @FocusState private var focusedControl: PlayerControlFocus?
     @State private var isAuxiliaryCardFocusActive = false
     @State private var playerButtonOrder = TVPlayerButtonOrder.currentOrder()
-    @State private var isNamingSubtitlePreset = false
-    @State private var presetNameToSave = ""
-    @State private var renamingPresetID: String?
+    @State private var dockTrigger: PlayerControlFocus = .settings
+    @State private var dockTab: PlayerDockTab = .tune
 
-    @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
     @AppStorage(SettingsKey.playerShowSources) private var playerShowSources = true
     @AppStorage(SettingsKey.playerShowSubtitles) private var playerShowSubtitles = true
@@ -53,59 +51,34 @@ struct PlayerControls: View {
     @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
 
     var body: some View {
-        ZStack {
-            GlassControlsContainer {
-                VStack {
-                    Spacer(minLength: 0)
-                    bottomControls
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        ZStack(alignment: .bottomTrailing) {
+            VStack {
+                Spacer(minLength: 0)
+                bottomControls
             }
-            .disabled(isNamingSubtitlePreset)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .disabled(viewModel.showPlayerDock)
 
-            if isNamingSubtitlePreset {
-                PlayerPresetNameDialog(
-                    title: renamingPresetID != nil
-                        ? L10n.string("subtitle_style_rename_title", fallback: "Rename Subtitle Preset")
-                        : L10n.string("subtitle_style_save_title", fallback: "Save Subtitle Preset"),
-                    text: $presetNameToSave,
-                    onSave: { customName in
-                        isNamingSubtitlePreset = false
-                        if let renamingPresetID {
-                            SubtitleStylePresetStore.shared.renameCustomPreset(id: renamingPresetID, newName: customName)
-                            self.renamingPresetID = nil
-                            viewModel.applySubtitleStyle()
-                            viewModel.showPlayerToast(L10n.format("subtitle_style_renamed_toast", fallback: "Renamed preset: %@", customName))
-                        } else {
-                            let newPreset = SubtitleStylePresetStore.shared.saveCurrentAsPreset(name: customName)
-                            viewModel.applySubtitleStyle()
-                            viewModel.showPlayerToast(L10n.format("subtitle_style_saved_toast", fallback: "Saved preset: %@", newPreset.name))
-                        }
-                        viewModel.setControlsAutoHideSuspended(false)
-                        viewModel.scheduleControlsHide(after: 10.0)
-                    },
-                    onCancel: {
-                        isNamingSubtitlePreset = false
-                        renamingPresetID = nil
-                        viewModel.setControlsAutoHideSuspended(false)
-                        viewModel.scheduleControlsHide(after: 10.0)
-                    }
+            if viewModel.showPlayerDock && !viewModel.showSettingsPanel {
+                PlayerDock(
+                    viewModel: viewModel,
+                    tab: $dockTab,
+                    tabs: dockTabs,
+                    speedShortcut: dockTrigger == .speed,
+                    onExit: handleExit
                 )
+                .padding(.trailing, 60)
+                .padding(.bottom, viewModel.isLiveStream ? 175 : 216)
                 .transition(.opacity)
             }
         }
-        .overlay(alignment: .topTrailing) {
-            if playerShowFinishTime && !viewModel.isLiveStream && !isNamingSubtitlePreset {
-                PlayerEstimatedFinishTime(
-                    clock: viewModel.clock,
-                    playbackSpeed: Double(viewModel.playbackSpeed.rawValue),
-                    status: viewModel.status,
-                    isScrubbing: viewModel.isScrubbing,
-                    pendingSeekDelta: viewModel.pendingSeekDelta
-                )
-                .padding(.top, 50)
-                .padding(.horizontal, 60)
-                .allowsHitTesting(false)
+        .animation(.easeOut(duration: 0.16), value: viewModel.showPlayerDock)
+        .overlay(alignment: .top) {
+            if didReportPlaybackStarted {
+                PlayerTelemetryBar(viewModel: viewModel, showsFinishTime: playerShowFinishTime)
+                    .padding(.top, 50)
+                    .padding(.horizontal, 60)
+                    .allowsHitTesting(false)
             }
         }
         .onExitCommand(perform: handleExit)
@@ -125,7 +98,7 @@ struct PlayerControls: View {
                 if resolvedTarget == .timeline {
                     focusedControl = .timeline
                 } else {
-                    focusedControl = isTransportButtonFocusable(resolvedTarget) ? resolvedTarget : (transportFocusOrder.first ?? .settings)
+                    focusedControl = transportFocusOrder.contains(resolvedTarget) ? resolvedTarget : (transportFocusOrder.first ?? .settings)
                 }
                 requestedFocus = nil
             }
@@ -139,7 +112,10 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.showSettingsPanel) { _, isPresented in
-            if !isPresented, viewModel.showControls {
+            guard !isPresented, viewModel.showControls else { return }
+            if viewModel.showPlayerDock {
+                viewModel.setControlsAutoHideSuspended(true)
+            } else {
                 DispatchQueue.main.async { focusedControl = .settings }
             }
         }
@@ -290,52 +266,22 @@ struct PlayerControls: View {
                 }
             }
         }
-        .onChange(of: focusedControl) { oldControl, newControl in
+        .onChange(of: viewModel.showPlayerDock) { _, isOpen in
+            guard !isOpen, viewModel.showControls, !viewModel.showSettingsPanel,
+                  !viewModel.isSwitchingSource, !viewModel.isAwaitingStreamStart else { return }
+            DispatchQueue.main.async {
+                guard !viewModel.showPlayerDock, controlsInteractable else { return }
+                moveFocus(to: transportFocusOrder.contains(dockTrigger) ? dockTrigger : .settings)
+            }
+        }
+        .onChange(of: focusedControl) { _, newControl in
             if newControl != nil {
                 isAuxiliaryCardFocusActive = false
             }
-            // Keep this in lockstep with focus so hold-to-seek gating is correct
-            // even before the next render cycle.
-            let onTimeline = (newControl == .timeline)
-            viewModel.setTimelineFocused(onTimeline)
-            // Opt-in breadcrumbs only: native Menu has no explicit presentation binding.
-            // These record focus transitions, not confirmed menu-open/menu-close events.
-            if newControl == nil {
-                if oldControl == .audio {
-                    PlaybackTimelineRecorder.record(.audioMenuFocusLeft, engine: viewModel.activeEngineKind)
-                } else if oldControl == .subtitles {
-                    PlaybackTimelineRecorder.record(.subtitleMenuFocusLeft, engine: viewModel.activeEngineKind)
-                }
-            } else if oldControl == nil {
-                if newControl == .audio {
-                    PlaybackTimelineRecorder.record(.audioMenuFocusReturned, engine: viewModel.activeEngineKind)
-                } else if newControl == .subtitles {
-                    PlaybackTimelineRecorder.record(.subtitleMenuFocusReturned, engine: viewModel.activeEngineKind)
-                }
-            }
-            if onTimeline {
+            viewModel.setTimelineFocused(newControl == .timeline)
+            if let newControl, !viewModel.showPlayerDock {
                 viewModel.setControlsAutoHideSuspended(false)
-                viewModel.scheduleControlsHide(after: 5.0)
-            } else if newControl != nil {
-                // A focused Menu button is not an open menu. Returning to it
-                // after selecting or cancelling must resume the hide timer.
-                viewModel.setControlsAutoHideSuspended(false)
-                viewModel.scheduleControlsHide(after: 10.0)
-            } else if viewModel.showControls,
-                      !isAuxiliaryCardFocusActive,
-                      let old = oldControl, old == .subtitles || old == .audio {
-                // Focus transitioned from a native Menu button into the presented menu items.
-                // Losing focus because controls were hidden must not suspend
-                // auto-hide and block a later revealControls() call.
-                DispatchQueue.main.async {
-                    // Card focus bindings update asynchronously with the focus handoff.
-                    guard focusedControl == nil,
-                          viewModel.showControls,
-                          !isAuxiliaryCardFocusActive,
-                          !isSkipSegmentFocused,
-                          !isNextEpisodeFocused else { return }
-                    viewModel.setControlsAutoHideSuspended(true)
-                }
+                viewModel.scheduleControlsHide(after: newControl == .timeline ? 5 : 10)
             }
         }
         .onDisappear {
@@ -346,9 +292,8 @@ struct PlayerControls: View {
     }
 
     private func handleExit() {
-        if isNamingSubtitlePreset {
-            isNamingSubtitlePreset = false
-            renamingPresetID = nil
+        if viewModel.showPlayerDock {
+            viewModel.closePlayerDock()
             return
         }
         PlaybackTimelineRecorder.record(.controlsExitReceived, engine: viewModel.activeEngineKind)
@@ -392,14 +337,14 @@ struct PlayerControls: View {
 
     /// Left-to-right order of currently visible transport buttons.
     private var transportFocusOrder: [PlayerControlFocus] {
-        availableTransportButtons.map(\.focusKey) + [.settings]
+        availableTransportButtons.compactMap(\.focusKey) + [.info, .settings]
     }
 
     private var availableTransportButtons: [TVPlayerButton] {
         playerButtonOrder.filter { button in
             switch button {
             case .pip:
-                return didReportPlaybackStarted && viewModel.isPictureInPictureSupported && playerShowPiP
+                return false
             case .episodes:
                 return viewModel.canShowEpisodesPanel && playerShowEpisodes
             case .sources:
@@ -426,29 +371,6 @@ struct PlayerControls: View {
 
     private var canShowAudioPicker: Bool {
         !viewModel.audioTracks.isEmpty || isPlaybackStarted
-    }
-
-    private var subtitleNoneOption: SubtitlePanelOption? {
-        guard let off = viewModel.subtitles.first(where: { $0.id == "off" }) else { return nil }
-        return SubtitlePanelOption(
-            id: "off",
-            kind: .track(off),
-            badge: "",
-            title: "None",
-            detail: nil,
-            language: "",
-            isSelected: off.isSelected
-        )
-    }
-
-    private var subtitlePickerOptions: [SubtitlePanelOption] {
-        subtitlePanelOptions(for: viewModel)
-    }
-
-    private func isTransportButtonFocusable(_ key: PlayerControlFocus) -> Bool {
-        guard controlsInteractable else { return false }
-        guard key != .pip || didReportPlaybackStarted else { return false }
-        return true
     }
 
     private func moveFocus(to control: PlayerControlFocus) {
@@ -561,7 +483,7 @@ struct PlayerControls: View {
                 HStack(alignment: .bottom, spacing: 24) {
                     playbackTitle
                     Spacer(minLength: 24)
-                    transportRow
+                    transportRow.fixedSize(horizontal: true, vertical: false)
                 }
                     .transition(.opacity)
             }
@@ -573,334 +495,100 @@ struct PlayerControls: View {
     }
 
     private var transportRow: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 12) {
             ForEach(availableTransportButtons) { button in
                 transportButton(button)
             }
-
-            glassIconButton(
-                size: 70,
-                iconSize: 30,
-                focusKey: .settings,
-                isFocused: focusedControl == .settings
-            ) {
-                viewModel.showSettingsPanel = true
-            } icon: {
-                Image(systemName: "ellipsis")
-            }
-            .id("settings_button")
+            actionPill(.info, title: "Info", icon: "info.circle") { openDock(.info, from: .info) }
+            actionPill(.settings, title: "Tune", icon: "slider.horizontal.3") { openDock(.tune, from: .settings) }
         }
         .focusSection()
     }
 
+    private var dockTabs: [PlayerDockTab] {
+        var tabs: [PlayerDockTab] = []
+        if canShowSubtitlePicker { tabs.append(.subtitles) }
+        if canShowAudioPicker { tabs.append(.audio) }
+        if viewModel.canShowSourcesPanel { tabs.append(.sources) }
+        if viewModel.canShowEpisodesPanel { tabs.append(.episodes) }
+        return tabs + [.info, .tune]
+    }
+
+    /// Keep the triggering transport pill selected while focus moves into the dock.
+    private func openDock(_ tab: PlayerDockTab, from trigger: PlayerControlFocus) {
+        dockTab = tab
+        dockTrigger = trigger
+        viewModel.openPlayerDock()
+    }
+
     @ViewBuilder
     private func transportButton(_ button: TVPlayerButton) -> some View {
+        let telemetry = viewModel.playerTelemetry
         switch button {
         case .pip:
-            glassIconButton(
-                size: 70,
-                iconSize: 28,
-                focusKey: .pip,
-                isFocused: focusedControl == .pip
-            ) {
-                viewModel.togglePictureInPicture()
-            } icon: {
-                Image(systemName: "pip.enter")
-            }
-            .id("pip_button")
-
+            EmptyView()
         case .episodes:
-            glassIconButton(
-                size: 70,
-                iconSize: 28,
-                focusKey: .episodes,
-                isFocused: focusedControl == .episodes
-            ) {
-                viewModel.openSidePanel(.episodes)
-            } icon: {
-                // Shows that the series is playing in shuffle.
-                Image(systemName: viewModel.isShufflingEpisodes ? "shuffle" : "list.bullet")
-            }
-            .id("episodes_button")
-
+            let episode = viewModel.currentEpisodeVideo.map { "S\($0.season)E\($0.episode)" }
+            actionPill(.episodes, title: "Episodes",
+                       icon: viewModel.isShufflingEpisodes ? "shuffle" : "rectangle.stack.badge.play",
+                       value: episode) { openDock(.episodes, from: .episodes) }
         case .sources:
-            glassIconButton(
-                size: 70,
-                iconSize: 28,
-                focusKey: .sources,
-                isFocused: focusedControl == .sources
-            ) {
-                viewModel.openSidePanel(.sources)
-            } icon: {
-                Image(systemName: "square.stack.3d.up")
-            }
-            .id("sources_button")
-
+            actionPill(.sources, title: "Sources", icon: "square.stack.3d.up",
+                       value: telemetry.resolution, badge: telemetry.resolutionBadge?.rawValue) { openDock(.sources, from: .sources) }
         case .subtitles:
-            let activeAddonSubtitle = viewModel.activeAddonSubtitle
-            let autoSyncState = activeAddonSubtitle.flatMap { viewModel.subtitleAutoSyncStates[$0.url] }
-            let isSubtitleAutoSyncUsingOriginal = activeAddonSubtitle.map {
-                viewModel.isSubtitleAutoSyncUsingOriginal($0.url)
-            } ?? false
-            let syncActionTitle: String = {
-                switch autoSyncState {
-                case .checking?:
-                    return L10n.string("player_autosync_running", fallback: "Checking…")
-                case .synced?:
-                    return L10n.string(
-                        isSubtitleAutoSyncUsingOriginal
-                            ? "player_subtitle_autosync_original"
-                            : "player_autosync_subtitle_synced",
-                        fallback: isSubtitleAutoSyncUsingOriginal ? "Original Timing" : "Subtitle Synced"
-                    )
-                case .kept(.inSync)?:
-                    return L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In Sync")
-                default:
-                    return L10n.string("player_autosync_sync_subtitle", fallback: "Sync Subtitle")
-                }
-            }()
-            let audioSyncStatus = viewModel.audioSyncStatus.flatMap {
-                $0.subtitleURL == activeAddonSubtitle?.url ? $0 : nil
-            }
-            let audioSyncTimingStatus = viewModel.audioSyncTimingStatusForCurrentSubtitle
-            let isAudioSyncRunningForSelectedSubtitle = viewModel.isAudioSyncRunning
-                && audioSyncStatus?.isRunning == true
-            let isAudioSyncAppliedForSelectedSubtitle = audioSyncTimingStatus != nil
-            let isAudioSyncUsingOriginalTiming = audioSyncTimingStatus?.isOriginalTimingSelected ?? false
-            let canToggleAudioSyncTiming = audioSyncTimingStatus.map {
-                $0.originalDelayMs != $0.syncedDelayMs
-            } ?? false
-            PlayerSubtitleMenuButton(
-                noneOption: subtitleNoneOption,
-                languageGroups: subtitleLanguageGroups,
-                isFocused: focusedControl == .subtitles,
-                autoSyncState: autoSyncState,
-                syncActionTitle: syncActionTitle,
-                isSubtitleAutoSyncUsingOriginal: isSubtitleAutoSyncUsingOriginal,
-                hasActiveAddonSubtitle: activeAddonSubtitle != nil,
-                isAudioSyncRunningForSelectedSubtitle: isAudioSyncRunningForSelectedSubtitle,
-                isAudioSyncAppliedForSelectedSubtitle: isAudioSyncAppliedForSelectedSubtitle,
-                isAudioSyncUsingOriginalTiming: isAudioSyncUsingOriginalTiming,
-                canToggleAudioSyncTiming: canToggleAudioSyncTiming,
-                canToggleAudioSync: activeAddonSubtitle != nil
-                    && (isAudioSyncRunningForSelectedSubtitle || viewModel.activeEngineKind == .aether),
-                activeStylePresetTitle: SubtitleStylePresetStore.shared.activePresetTitle(for: viewModel.subtitleStyle),
-                activeStylePresetID: SubtitleStylePresetStore.shared.activePreset(for: viewModel.subtitleStyle)?.id,
-                stylePresets: SubtitleStylePresetStore.shared.allPresets(),
-                onSelect: { selectSubtitlePickerOption($0) },
-                onRunAutoSync: {
-                    guard let activeAddonSubtitle = viewModel.activeAddonSubtitle else { return }
-                    switch viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] {
-                    case .checking?, .synced?, .kept(.inSync)?:
-                        return
-                    default:
-                        viewModel.runSubtitleAutoSyncNow()
-                    }
-                },
-                onToggleSubtitleTiming: {
-                    guard let activeAddonSubtitle = viewModel.activeAddonSubtitle,
-                          case .synced? = viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] else {
-                        return
-                    }
-                    viewModel.toggleSubtitleAutoSyncTiming()
-                },
-                onToggleAudioSync: {
-                    if viewModel.isAudioSyncRunning,
-                       let activeAddonSubtitle,
-                       viewModel.audioSyncStatus?.subtitleURL != activeAddonSubtitle.url {
-                        viewModel.startAudioSync()
-                    } else {
-                        viewModel.toggleAudioSync()
-                    }
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onToggleAudioSyncTiming: {
-                    viewModel.toggleAudioSyncTiming()
-                },
-                onSelectPreset: { preset in
-                    SubtitleStylePresetStore.shared.applyPreset(preset)
-                    viewModel.applySubtitleStyle()
-                    viewModel.showPlayerToast(L10n.format("subtitle_style_applied_toast", fallback: "Style: %@", preset.name))
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                }
-            )
-            .equatable()
-            .focused($focusedControl, equals: .subtitles)
-            .disabled(!isTransportButtonFocusable(.subtitles))
-            .onExitCommand(perform: handleExit)
-            .onMoveCommand { direction in
-                handleMove(direction, from: .subtitles)
-            }
-
+            let subtitle = viewModel.subtitles.first { $0.isSelected }
+            let language = viewModel.activeAddonSubtitle?.language ?? subtitle?.language
+            let value = PlayerTelemetry.language(language) ?? (subtitle?.id == "off" ? "Off" : nil)
+            actionPill(.subtitles, title: "Subtitles", icon: "captions.bubble",
+                       value: value) { openDock(.subtitles, from: .subtitles) }
         case .audio:
-            PlayerAudioMenuButton(
-                orderedTracks: orderedAudioTracks,
-                supportsAudioProcessing: viewModel.supportsAudioProcessing,
-                enhanceDialogueMode: viewModel.supportsAudioProcessing ? viewModel.enhanceDialogueMode : .off,
-                isReduceLoudSoundsActive: viewModel.supportsAudioProcessing && viewModel.isReduceLoudSoundsActive,
-                isFocused: focusedControl == .audio,
-                onSelectTrack: { track in
-                    viewModel.selectAudio(track)
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onSetEnhanceDialogueMode: { mode in
-                    viewModel.setEnhanceDialogueMode(mode)
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onToggleReduceLoudSounds: {
-                    viewModel.toggleReduceLoudSounds()
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onUpdateLoudnessTarget: {
-                    viewModel.updateLoudnessTarget()
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                }
-            )
-            .equatable()
-            .focused($focusedControl, equals: .audio)
-            .disabled(!isTransportButtonFocusable(.audio))
-            .onExitCommand(perform: handleExit)
-            .onMoveCommand { direction in
-                handleMove(direction, from: .audio)
-            }
-
+            actionPill(.audio, title: "Audio", icon: "speaker.wave.2",
+                       value: telemetry.audio, badge: telemetry.audioBadge?.rawValue) { openDock(.audio, from: .audio) }
         case .speed:
-            PlayerSpeedMenuButton(
-                currentSpeed: viewModel.playbackSpeed,
-                isFocused: focusedControl == .speed,
-                onSelectSpeed: { speed in
-                    viewModel.setSpeed(speed)
-                    viewModel.showPlayerToast("Speed \(speed.label)")
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                }
-            )
-            .equatable()
-            .focused($focusedControl, equals: .speed)
-            .disabled(!isTransportButtonFocusable(.speed))
-            .onExitCommand(perform: handleExit)
-            .onMoveCommand { direction in
-                handleMove(direction, from: .speed)
-            }
+            actionPill(.speed, title: "Speed", icon: "gauge.with.dots.needle.33percent",
+                       value: viewModel.playbackSpeed.dockLabel) { openDock(.speed, from: .speed) }
         }
     }
 
-    private func glassIconButton<Icon: View>(
-        size: CGFloat,
-        iconSize: CGFloat,
-        focusKey: PlayerControlFocus,
-        isFocused: Bool,
-        action: @escaping () -> Void,
-        @ViewBuilder icon: () -> Icon
+    /// A remote-focusable transport pill with an optional text or vector value.
+    private func actionPill(
+        _ key: PlayerControlFocus, title: String, icon: String, value: String? = nil,
+        badge: String? = nil, action: @escaping () -> Void
     ) -> some View {
-        // Use a real Button action for Siri Remote Select. Do not stack an extra
-        // `.focusable(...)` on the Button — toggling that when focus leaves the
-        // timeline (or moves settings → play) can leave the control visually
-        // focused while Select no longer activates the action.
-        //
-        // Mirror Settings category pills: `.disabled` removes a button from the
-        // spatial focus graph without changing appearance (PosterCardButtonStyle
-        // ignores isEnabled). That prevents the Episodes flash on up-from-timeline.
-        Button {
-            focusedControl = focusKey
-            action()
-        } label: {
-            icon()
-                .font(.system(size: iconSize, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white)
-                .frame(width: size, height: size)
-                .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .frame(width: size, height: size)
-                .clipShape(Circle())
-                .contentShape(Circle())
+        let focused = viewModel.showPlayerDock ? key == dockTrigger : key == focusedControl
+        return Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: icon).font(.system(size: 23, weight: .semibold))
+                Text(title).font(.system(size: 20, weight: .semibold)).lineLimit(1)
+                if let badge {
+                    PlayerBadgeImage(asset: badge, height: 17)
+                        .accessibilityHidden(true)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background((focused ? Color.black : Color.white).opacity(0.14), in: Capsule())
+                } else if let value, key != .audio {
+                    Text(value)
+                        .font(.system(size: 16, weight: .semibold))
+                        .lineLimit(1)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background((focused ? Color.black : Color.white).opacity(0.14), in: Capsule())
+                }
+            }
+            .padding(.horizontal, 15)
+            .frame(minWidth: 58, minHeight: 58)
+            .foregroundStyle(focused ? Color.playerGlassInk : .white)
+            .modifier(PlayerGlassSurface(shape: Capsule(), filled: focused))
+            .contentShape(Capsule())
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused($focusedControl, equals: focusKey)
-        .disabled(!isTransportButtonFocusable(focusKey))
+        .focused($focusedControl, equals: key)
+        .disabled(!controlsInteractable)
         .focusEffectDisabledIfAvailable()
-        .onExitCommand(perform: handleExit)
-        .onMoveCommand { direction in
-            // Route from this button's key so a native spatial jump across the
-            // row Spacer cannot make us advance from the wrong origin (which
-            // skipped sources / never returned up-to-play).
-            handleMove(direction, from: focusKey)
-        }
-        .scaleEffect(isFocused ? 1.06 : 1.0)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-    }
-
-    private var subtitleLanguageGroups: [SubtitleLanguageGroup] {
-        var groups: [String: [SubtitlePanelOption]] = [:]
-        var order: [String] = []
-        for option in subtitlePickerOptions {
-            if groups[option.language] == nil {
-                order.append(option.language)
-            }
-            groups[option.language, default: []].append(option)
-        }
-        let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
-        let sortedLanguages = order.sorted { lhs, rhs in
-            let lhsRank = preferredLanguages.firstIndex {
-                SubtitleLanguagePreferences.matches(lhs, target: $0)
-            }
-            let rhsRank = preferredLanguages.firstIndex {
-                SubtitleLanguagePreferences.matches(rhs, target: $0)
-            }
-            switch (lhsRank, rhsRank) {
-            case let (left?, right?) where left != right:
-                return left < right
-            case (_?, nil):
-                return true
-            case (nil, _?):
-                return false
-            default:
-                break
-            }
-            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
-        }
-
-        return sortedLanguages.map { lang in
-            SubtitleLanguageGroup(language: lang, options: groups[lang] ?? [])
-        }
-    }
-
-    private func selectSubtitlePickerOption(_ option: SubtitlePanelOption) {
-        switch option.kind {
-        case .track(let track):
-            viewModel.selectSubtitle(track)
-        case .external(let subtitle):
-            viewModel.selectExternalSubtitle(subtitle)
-        }
-        viewModel.setControlsAutoHideSuspended(false)
-        viewModel.scheduleControlsHide(after: 10.0)
-    }
-
-    private var orderedAudioTracks: [AudioTrack] {
-        let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: viewModel.activeMeta)
-        return viewModel.audioTracks.enumerated().sorted { lhs, rhs in
-            let lhsPreferred = preferred.map { audioTrack(lhs.element, matches: $0) } ?? false
-            let rhsPreferred = preferred.map { audioTrack(rhs.element, matches: $0) } ?? false
-            if lhsPreferred != rhsPreferred { return lhsPreferred }
-
-            let lhsLanguage = lhs.element.languageName.isEmpty ? lhs.element.name : lhs.element.languageName
-            let rhsLanguage = rhs.element.languageName.isEmpty ? rhs.element.name : rhs.element.languageName
-            let comparison = lhsLanguage.localizedCaseInsensitiveCompare(rhsLanguage)
-            if comparison != .orderedSame { return comparison == .orderedAscending }
-            return lhs.offset < rhs.offset
-        }
-        .map(\.element)
-    }
-
-    private func audioTrack(_ track: AudioTrack, matches language: String) -> Bool {
-        SubtitleLanguagePreferences.matches(track.language, target: language) ||
-        SubtitleLanguagePreferences.matches(track.languageName, target: language) ||
-        SubtitleLanguagePreferences.matches(track.name, target: language)
+        .accessibilityLabel([title, value].compactMap { $0 }.joined(separator: ", "))
+        .accessibilityIdentifier("\(key)_button")
+        .onMoveCommand { handleMove($0, from: key) }
+        .animation(.easeOut(duration: 0.16), value: focused)
     }
 
     // MARK: - Timeline
@@ -940,7 +628,6 @@ struct PlayerControls: View {
             pendingSeekDelta: viewModel.pendingSeekDelta,
             speedMultiplier: viewModel.seekSpeedMultiplier,
             seekStepSeconds: viewModel.seekStepSeconds,
-            chapters: viewModel.chapters,
             skipSegments: viewModel.skipSegments
         )
         .overlay(alignment: .top) {
@@ -991,534 +678,7 @@ struct PlayerControls: View {
     }
 }
 
-// MARK: - Native Subtitle & Audio Menu Buttons (Isolated EquatableViews)
-
-private struct PlayerSubtitleMenuButton: View, Equatable {
-    let noneOption: SubtitlePanelOption?
-    let languageGroups: [SubtitleLanguageGroup]
-    let isFocused: Bool
-    let autoSyncState: SubtitleAutoSyncState?
-    let syncActionTitle: String
-    let isSubtitleAutoSyncUsingOriginal: Bool
-    let hasActiveAddonSubtitle: Bool
-    let isAudioSyncRunningForSelectedSubtitle: Bool
-    let isAudioSyncAppliedForSelectedSubtitle: Bool
-    let isAudioSyncUsingOriginalTiming: Bool
-    let canToggleAudioSyncTiming: Bool
-    let canToggleAudioSync: Bool
-    let activeStylePresetTitle: String
-    let activeStylePresetID: String?
-    let stylePresets: [SubtitleStylePreset]
-    let onSelect: (SubtitlePanelOption) -> Void
-    let onRunAutoSync: () -> Void
-    let onToggleSubtitleTiming: () -> Void
-    let onToggleAudioSync: () -> Void
-    let onToggleAudioSyncTiming: () -> Void
-    let onSelectPreset: (SubtitleStylePreset) -> Void
-
-    static func == (lhs: PlayerSubtitleMenuButton, rhs: PlayerSubtitleMenuButton) -> Bool {
-        lhs.isFocused == rhs.isFocused
-            && lhs.noneOption == rhs.noneOption
-            && lhs.languageGroups == rhs.languageGroups
-            && lhs.autoSyncState == rhs.autoSyncState
-            && lhs.syncActionTitle == rhs.syncActionTitle
-            && lhs.isSubtitleAutoSyncUsingOriginal == rhs.isSubtitleAutoSyncUsingOriginal
-            && lhs.hasActiveAddonSubtitle == rhs.hasActiveAddonSubtitle
-            && lhs.isAudioSyncRunningForSelectedSubtitle == rhs.isAudioSyncRunningForSelectedSubtitle
-            && lhs.isAudioSyncAppliedForSelectedSubtitle == rhs.isAudioSyncAppliedForSelectedSubtitle
-            && lhs.isAudioSyncUsingOriginalTiming == rhs.isAudioSyncUsingOriginalTiming
-            && lhs.canToggleAudioSyncTiming == rhs.canToggleAudioSyncTiming
-            && lhs.canToggleAudioSync == rhs.canToggleAudioSync
-            && lhs.activeStylePresetTitle == rhs.activeStylePresetTitle
-            && lhs.activeStylePresetID == rhs.activeStylePresetID
-            && lhs.stylePresets == rhs.stylePresets
-    }
-
-    var body: some View {
-        Menu {
-            Section(L10n.string("playback_section_subtitles", fallback: "Subtitles")) {
-                switch autoSyncState {
-                case .synced?:
-                    Button {} label: {
-                        Label(
-                            syncActionTitle,
-                            systemImage: isSubtitleAutoSyncUsingOriginal ? "clock" : "checkmark.circle"
-                        )
-                    }
-                    .disabled(true)
-
-                    Button {
-                        onToggleSubtitleTiming()
-                    } label: {
-                        Label(
-                            L10n.string(
-                                isSubtitleAutoSyncUsingOriginal
-                                    ? "player_autosync_use_synced"
-                                    : "player_subtitle_autosync_original",
-                                fallback: isSubtitleAutoSyncUsingOriginal ? "Synced Timing" : "Original Timing"
-                            ),
-                            systemImage: isSubtitleAutoSyncUsingOriginal ? "checkmark.circle" : "arrow.uturn.backward"
-                        )
-                    }
-                    .menuActionDismissBehavior(.disabled)
-
-                case .kept(.inSync)?:
-                    Button {} label: {
-                        Label(syncActionTitle, systemImage: "checkmark.circle")
-                    }
-                    .disabled(true)
-
-                case .checking?, nil:
-                    Button {
-                        onRunAutoSync()
-                    } label: {
-                        Label(syncActionTitle, systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .menuActionDismissBehavior(.disabled)
-                    .disabled(!hasActiveAddonSubtitle)
-
-                default:
-                    Button {
-                        onRunAutoSync()
-                    } label: {
-                        Label(syncActionTitle, systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .menuActionDismissBehavior(.disabled)
-                    .disabled(!hasActiveAddonSubtitle)
-                }
-
-                if isAudioSyncAppliedForSelectedSubtitle {
-                    Button {} label: {
-                        Label(
-                            L10n.string(
-                                isAudioSyncUsingOriginalTiming
-                                    ? "player_subtitle_autosync_original"
-                                    : "player_autosync_audio_synced",
-                                fallback: isAudioSyncUsingOriginalTiming ? "Original Timing" : "Synced by Audio"
-                            ),
-                            systemImage: isAudioSyncUsingOriginalTiming ? "clock" : "checkmark.circle"
-                        )
-                    }
-                    .disabled(true)
-
-                    if canToggleAudioSyncTiming {
-                        Button {
-                            onToggleAudioSyncTiming()
-                        } label: {
-                            Label(
-                                L10n.string(
-                                    isAudioSyncUsingOriginalTiming
-                                        ? "player_autosync_use_synced"
-                                        : "player_subtitle_autosync_original",
-                                    fallback: isAudioSyncUsingOriginalTiming ? "Synced Timing" : "Original Timing"
-                                ),
-                                systemImage: isAudioSyncUsingOriginalTiming ? "checkmark.circle" : "arrow.uturn.backward"
-                            )
-                        }
-                        .menuActionDismissBehavior(.disabled)
-                    }
-                } else {
-                    Button {
-                        onToggleAudioSync()
-                    } label: {
-                        Label(
-                            L10n.string(
-                                isAudioSyncRunningForSelectedSubtitle ? "player_autosync_audio_stop" : "player_autosync_audio",
-                                fallback: isAudioSyncRunningForSelectedSubtitle ? "Stop Listening" : "Sync by Audio"
-                            ),
-                            systemImage: isAudioSyncRunningForSelectedSubtitle ? "stop.circle" : "waveform"
-                        )
-                    }
-                    .disabled(!canToggleAudioSync)
-                }
-
-                Menu {
-                    ForEach(stylePresets) { preset in
-                        Button {
-                            onSelectPreset(preset)
-                        } label: {
-                            subtitleMenuItem(
-                                title: preset.name,
-                                isSelected: activeStylePresetID == preset.id
-                            )
-                        }
-                    }
-                } label: {
-                    HStack {
-                        Label(
-                            L10n.string("subtitle_style_title", fallback: "Subtitle Style"),
-                            systemImage: "textformat"
-                        )
-                        Spacer()
-                        Text(activeStylePresetTitle)
-                    }
-                }
-
-                Divider()
-
-                if let none = noneOption {
-                    Button {
-                        onSelect(none)
-                    } label: {
-                        subtitleMenuItem(
-                            title: L10n.string("action_none", fallback: "None"),
-                            isSelected: none.isSelected
-                        )
-                    }
-                }
-
-                ForEach(languageGroups) { group in
-                    Menu {
-                        if !group.builtInOptions.isEmpty {
-                            Section(L10n.string("tvos_settings_option_built_in", fallback: "Built-In")) {
-                                ForEach(group.builtInOptions) { option in
-                                    let labels = SubtitleMenuFormatter.builtInMenuLabels(option: option)
-                                    Button {
-                                        onSelect(option)
-                                    } label: {
-                                        subtitleMenuItem(
-                                            title: labels.title,
-                                            subtitle: labels.subtitle,
-                                            isSelected: option.isSelected
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        if !group.externalOptions.isEmpty {
-                            Section(L10n.string("player_external_subtitles", fallback: "External Subtitles")) {
-                                ForEach(group.externalOptions) { option in
-                                    let labels = SubtitleMenuFormatter.groupedExternalMenuLabels(option: option)
-                                    Button {
-                                        onSelect(option)
-                                    } label: {
-                                        subtitleMenuItem(
-                                            title: labels.title,
-                                            subtitle: labels.subtitle,
-                                            isSelected: option.isSelected
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack {
-                            if let selected = group.selectedOption {
-                                let selectedTitle = SubtitleMenuFormatter.optionDisplayTitle(for: selected)
-                                if !selectedTitle.isEmpty && selectedTitle.caseInsensitiveCompare(group.language) != .orderedSame {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(group.language)
-                                        Text(selectedTitle)
-                                    }
-                                } else {
-                                    Text(group.language)
-                                }
-                            } else {
-                                Text(group.language)
-                            }
-                            Spacer()
-                            if group.hasSelected {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "captions.bubble")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white)
-                .frame(width: 70, height: 70)
-                .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .frame(width: 70, height: 70)
-                .clipShape(Circle())
-                .contentShape(Circle())
-        }
-        .menuStyle(.borderlessButton)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.06 : 1.0)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .id("subtitles_button")
-    }
-
-    @ViewBuilder
-    private func subtitleMenuItem(
-        title: String,
-        subtitle: String? = nil,
-        isSelected: Bool
-    ) -> some View {
-        Text(title)
-        if let subtitle, !subtitle.isEmpty {
-            Text(subtitle)
-        }
-        if isSelected {
-            Image(systemName: "checkmark")
-        }
-    }
-}
-
-private struct PlayerAudioMenuButton: View, Equatable {
-    let orderedTracks: [AudioTrack]
-    let supportsAudioProcessing: Bool
-    let enhanceDialogueMode: EnhanceDialogueMode
-    let isReduceLoudSoundsActive: Bool
-    let isFocused: Bool
-    let onSelectTrack: (AudioTrack) -> Void
-    let onSetEnhanceDialogueMode: (EnhanceDialogueMode) -> Void
-    let onToggleReduceLoudSounds: () -> Void
-    var onUpdateLoudnessTarget: (() -> Void)? = nil
-
-    @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
-    @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
-
-    static func == (lhs: PlayerAudioMenuButton, rhs: PlayerAudioMenuButton) -> Bool {
-        lhs.isFocused == rhs.isFocused
-            && lhs.supportsAudioProcessing == rhs.supportsAudioProcessing
-            && lhs.enhanceDialogueMode == rhs.enhanceDialogueMode
-            && lhs.isReduceLoudSoundsActive == rhs.isReduceLoudSoundsActive
-            && lhs.orderedTracks == rhs.orderedTracks
-            && lhs.loudnessNormalizer == rhs.loudnessNormalizer
-            && lhs.loudnessTargetPreset == rhs.loudnessTargetPreset
-    }
-
-    var body: some View {
-        Menu {
-            if supportsAudioProcessing {
-                Section(L10n.string("player_audio_adjustments", fallback: "Audio Adjustments")) {
-                    Menu {
-                        ForEach(EnhanceDialogueMode.allCases) { mode in
-                            Button {
-                                onSetEnhanceDialogueMode(mode)
-                            } label: {
-                                audioMenuItem(
-                                    title: mode.title,
-                                    isSelected: enhanceDialogueMode == mode
-                                )
-                            }
-                        }
-                    } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(L10n.string("player_enhance_dialogue", fallback: "Enhance Dialogue"))
-                            Text(enhanceDialogueMode.title)
-                        }
-                    }
-
-                    Button {
-                        onToggleReduceLoudSounds()
-                    } label: {
-                        audioMenuItem(
-                            title: L10n.string("player_reduce_loud_sounds", fallback: "Reduce Loud Sounds"),
-                            isSelected: isReduceLoudSoundsActive
-                        )
-                    }
-
-                    if loudnessNormalizer {
-                        Menu {
-                            Button {
-                                loudnessTargetPreset = "standard"
-                                onUpdateLoudnessTarget?()
-                            } label: {
-                                audioMenuItem(
-                                    title: L10n.string("tvos_settings_loudness_standard", fallback: "Cinema / Standard (-24 LUFS)"),
-                                    isSelected: loudnessTargetPreset == "standard"
-                                )
-                            }
-                            Button {
-                                loudnessTargetPreset = "night"
-                                onUpdateLoudnessTarget?()
-                            } label: {
-                                audioMenuItem(
-                                    title: L10n.string("tvos_settings_loudness_night", fallback: "Night Listening (-20 LUFS)"),
-                                    isSelected: loudnessTargetPreset == "night"
-                                )
-                            }
-                            Button {
-                                loudnessTargetPreset = "boost"
-                                onUpdateLoudnessTarget?()
-                            } label: {
-                                audioMenuItem(
-                                    title: L10n.string("tvos_settings_loudness_boost", fallback: "Quiet Source Boost (-16 LUFS)"),
-                                    isSelected: loudnessTargetPreset == "boost"
-                                )
-                            }
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(L10n.string("tvos_settings_loudness_target", fallback: "Loudness Target"))
-                                Text(loudnessTargetPresetTitle(loudnessTargetPreset))
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !orderedTracks.isEmpty {
-                Section(L10n.string("player_audio_tracks", fallback: "Audio Tracks")) {
-                    ForEach(orderedTracks) { track in
-                        Button {
-                            onSelectTrack(track)
-                        } label: {
-                            audioMenuItem(
-                                title: audioMenuTrackTitle(for: track),
-                                isSelected: track.isSelected
-                            )
-                        }
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "waveform")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white)
-                .frame(width: 70, height: 70)
-                .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .frame(width: 70, height: 70)
-                .clipShape(Circle())
-                .contentShape(Circle())
-        }
-        .menuStyle(.borderlessButton)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.06 : 1.0)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .id("audio_button")
-    }
-
-    private func audioMenuItem(title: String, isSelected: Bool) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            if isSelected {
-                Image(systemName: "checkmark")
-            }
-        }
-    }
-
-    private func loudnessTargetPresetTitle(_ preset: String) -> String {
-        switch preset {
-        case "night":
-            return L10n.string("tvos_settings_loudness_night", fallback: "Night Listening (-20 LUFS)")
-        case "boost":
-            return L10n.string("tvos_settings_loudness_boost", fallback: "Quiet Source Boost (-16 LUFS)")
-        default:
-            return L10n.string("tvos_settings_loudness_standard", fallback: "Cinema / Standard (-24 LUFS)")
-        }
-    }
-
-    private func audioMenuTrackTitle(for track: AudioTrack) -> String {
-        let rawName = track.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rawLang = track.language.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rawLangName = track.languageName.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let langIdentifier = !rawLang.isEmpty ? rawLang : rawLangName
-        let humanLanguage = SubtitleLanguagePreferences.humanLanguageName(from: langIdentifier)
-
-        // 1. If name is completely empty or just generic "Track 1" / "Track 2"
-        let isGenericTrack = rawName.isEmpty || rawName.range(of: #"^Track\s*\d+$"#, options: [.regularExpression, .caseInsensitive]) != nil
-        if isGenericTrack {
-            if !humanLanguage.isEmpty {
-                return humanLanguage
-            }
-            return rawName.isEmpty ? L10n.format("player_track_format", fallback: "Track %d", track.id) : rawName
-        }
-
-        // 2. If name is just the language code (e.g. "eng", "en", "fra", "nob")
-        if (!rawLang.isEmpty && rawName.caseInsensitiveCompare(rawLang) == .orderedSame) ||
-           (!rawLangName.isEmpty && rawName.caseInsensitiveCompare(rawLangName) == .orderedSame) {
-            return !humanLanguage.isEmpty ? humanLanguage : rawName.capitalized
-        }
-
-        // 3. If name starts with the language code (e.g. "eng (DTS-HD MA 5.1)", "eng [Original]", "eng - 5.1")
-        if !humanLanguage.isEmpty {
-            let codeToCheck = !rawLang.isEmpty ? rawLang : rawLangName
-            if !codeToCheck.isEmpty {
-                let pattern = #"^"# + NSRegularExpression.escapedPattern(for: codeToCheck) + #"\b[\s:_\-]*"#
-                if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-                    let range = NSRange(rawName.startIndex..<rawName.endIndex, in: rawName)
-                    if let match = regex.firstMatch(in: rawName, options: [], range: range) {
-                        let startIndex = rawName.index(rawName.startIndex, offsetBy: match.range.length)
-                        let suffix = String(rawName[startIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if suffix.isEmpty {
-                            return humanLanguage
-                        } else if suffix.hasPrefix("(") || suffix.hasPrefix("[") {
-                            return "\(humanLanguage) \(suffix)"
-                        } else {
-                            return "\(humanLanguage) (\(suffix))"
-                        }
-                    }
-                }
-            }
-
-            // 4. If name already contains the full language name (e.g. "English (Original)")
-            if rawName.localizedCaseInsensitiveContains(humanLanguage) {
-                return rawName
-            }
-
-            // 5. If name is another descriptor without language (e.g. "Director's Commentary" or "DTS 5.1")
-            return "\(humanLanguage) (\(rawName))"
-        }
-
-        return rawName
-    }
-}
-
-private struct PlayerSpeedMenuButton: View, Equatable {
-    let currentSpeed: PlaybackSpeed
-    let isFocused: Bool
-    let onSelectSpeed: (PlaybackSpeed) -> Void
-
-    static func == (lhs: PlayerSpeedMenuButton, rhs: PlayerSpeedMenuButton) -> Bool {
-        lhs.isFocused == rhs.isFocused
-            && lhs.currentSpeed == rhs.currentSpeed
-    }
-
-    var body: some View {
-        Menu {
-            Section(L10n.string("player_speed_title", fallback: "Playback Speed")) {
-                ForEach(PlaybackSpeed.allCases) { speed in
-                    Button {
-                        onSelectSpeed(speed)
-                    } label: {
-                        speedMenuItem(
-                            title: speedTitle(for: speed),
-                            isSelected: currentSpeed == speed
-                        )
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "gauge.with.dots.needle.bottom.50percent")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white)
-                .frame(width: 70, height: 70)
-                .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .frame(width: 70, height: 70)
-                .clipShape(Circle())
-                .contentShape(Circle())
-        }
-        .menuStyle(.borderlessButton)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.06 : 1.0)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .id("speed_button")
-    }
-
-    private func speedMenuItem(title: String, isSelected: Bool) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            if isSelected {
-                Image(systemName: "checkmark")
-            }
-        }
-    }
-
-    private func speedTitle(for speed: PlaybackSpeed) -> String {
-        if speed == .normal {
-            return "\(speed.label) (\(L10n.string("player_speed_normal", fallback: "Normal")))"
-        }
-        return speed.label
-    }
-}
+// MARK: - Timeline views
 
 private struct SeekPreviewTimelineCard: View {
     @ObservedObject var clock: PlaybackClock
@@ -1573,12 +733,13 @@ enum PlayerFinishEstimate {
     }
 }
 
-private struct PlayerEstimatedFinishTime: View {
+struct PlayerEstimatedFinishTime: View {
     @ObservedObject var clock: PlaybackClock
     let playbackSpeed: Double
     let status: PlayerStatus
     let isScrubbing: Bool
     let pendingSeekDelta: Double
+    var isPauseCard = false
 
     var body: some View {
         if status == .playing || status == .paused {
@@ -1588,12 +749,15 @@ private struct PlayerEstimatedFinishTime: View {
                     let time = end.formatted(date: .omitted, time: .shortened)
                     // One short label for movies and episodes, playing or paused (the time keeps
                     // moving while paused), like the system player's "Ends at".
-                    let label = L10n.format("player_ends_at", fallback: "Ends at %@", time)
+                    let label = isPauseCard
+                        ? L10n.format("player_paused_ends_at", fallback: "Paused · Ends %@", time)
+                        : L10n.format("player_ends_at", fallback: "Ends at %@", time)
                     Text(label)
                         .font(.system(size: 19, weight: .medium))
-                        .foregroundColor(.white.opacity(0.76))
-                        .shadow(color: .black.opacity(0.9), radius: 4)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .modifier(PlayerGlassSurface(shape: Capsule()))
                         .accessibilityLabel(label)
                 }
             }
@@ -1609,19 +773,11 @@ private struct PlayerTimelineBar: View {
     let pendingSeekDelta: Double
     var speedMultiplier: Int? = nil
     var seekStepSeconds: Int = PlayerSeekSettings.defaultStep
-    /// Chapters of the file: marks on the track and the chapter's name by the time.
-    var chapters: [PlaybackChapter] = []
     /// Opening and ending (IntroDB or chapters), colored on the track.
     var skipSegments: [SkipInterval] = []
 
     private var duration: Double {
         max(clock.duration, 0.001)
-    }
-
-    /// The name of the chapter at `seconds`, if the file has chapters.
-    private func chapterName(at seconds: Double) -> String? {
-        guard let index = PlaybackChapters.index(at: seconds, in: chapters) else { return nil }
-        return PlaybackChapters.displayName(chapters[index], index: index)
     }
 
     private var skipIconName: String {
@@ -1660,11 +816,10 @@ private struct PlayerTimelineBar: View {
                 let originalProgress = CGFloat(min(max(clock.position / duration, 0), 1))
                 let originalX = min(max(w * originalProgress, 0), w)
                 let bottomOfTrack = geo.size.height / 2 + h / 2
-                let markers = PlaybackChapters.markers(chapters, duration: clock.duration)
-                // The opening and the ending, colored unless that is off in Settings → Player.
+                // Opening and ending retain their distinct ranges in monochrome.
                 let segments = PlaybackChapters.showsSegmentsOnTimeline(in: ProfileSettings.current)
                     ? PlaybackChapters.timelineSegments(skipSegments, duration: clock.duration).map {
-                        PlayerTrackSegment(start: $0.start, end: $0.end, color: $0.kind.color)
+                        PlayerTrackSegment(start: $0.start, end: $0.end, color: .white.opacity(0.48))
                     }
                     : []
 
@@ -1676,7 +831,6 @@ private struct PlayerTimelineBar: View {
                         showThumb: false,
                         emphasized: isTimelineFocused || isSeekingOrScrubbing,
                         glassTrack: true,
-                        markers: markers,
                         segments: segments
                     )
 
@@ -1703,32 +857,18 @@ private struct PlayerTimelineBar: View {
             if isSeekingOrScrubbing {
                 GeometryReader { geo in
                     let w = geo.size.width
-                    let targetChapter = chapterName(at: targetPosition)
                     let timeText = PlayerTime.formatted(time: targetPosition)
-                    let chapterText = targetChapter.map { "· " + $0 }
                     let timeWidth = CGFloat(timeText.count) * 13
-                    let chapterWidth = chapterText.map { min(CGFloat($0.count) * 12, 320) } ?? 0
                     let seekAccessoryWidth: CGFloat = (isHoldingSeek || speedMultiplier != nil)
                         ? 34 + (speedMultiplier.map { CGFloat(String($0).count) * 14 + 8 } ?? 0)
                         : (pendingSeekDelta != 0 ? 28 : 0)
-                    let labelWidth = timeWidth
-                        + (chapterWidth > 0 ? chapterWidth + 8 : 0)
-                        + seekAccessoryWidth
+                    let labelWidth = timeWidth + seekAccessoryWidth
                     let edgeInset = labelWidth / 2 + 8
                     let targetX = min(max(w * progress, edgeInset), max(edgeInset, w - edgeInset))
                     HStack(spacing: 8) {
                         Text(timeText)
                             .font(.system(size: 22, weight: .bold).monospacedDigit())
                             .foregroundColor(.white)
-                        if let chapterText {
-                            Text(chapterText)
-                                .font(.system(size: 22, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.85))
-                                .lineLimit(1)
-                                .frame(maxWidth: 320)
-                                .fixedSize(horizontal: true, vertical: false)
-                        }
-
                         if isHoldingSeek || speedMultiplier != nil {
                             let isForward = pendingSeekDelta >= 0
                             Image(systemName: isForward ? "forward.fill" : "backward.fill")
@@ -1753,11 +893,7 @@ private struct PlayerTimelineBar: View {
                 .frame(height: 28)
             } else {
                 GeometryReader { geo in
-                    // The chapter's name rides with the elapsed time (shortened to stay on the bar).
-                    let chapter = chapterName(at: targetPosition).map { name in
-                        name.count > 32 ? String(name.prefix(31)) + "…" : name
-                    }
-                    let elapsed = PlayerTime.formatted(time: targetPosition) + (chapter.map { " · " + $0 } ?? "")
+                    let elapsed = PlayerTime.formatted(time: targetPosition)
                     let remaining = "-" + PlayerTime.formatted(time: max(0, duration - targetPosition))
                     let elapsedHalfWidth = CGFloat(elapsed.count) * 6.5
                     let remainingWidth = CGFloat(remaining.count) * 13
@@ -2109,10 +1245,8 @@ struct PlayerBottomFade: View {
 
 // MARK: - Player settings panel
 //
-// Full-screen overlay opened from the controls' ellipsis button. Three pages:
-// Subtitles (default — languages / tracks / style, mirroring the iOS app's
-// player subtitle screen), Audio, and Speed. Renders over the dimmed video so
-// style changes are visible live on the captions behind it.
+// Advanced settings opened from the dock. Renders over the dimmed video
+// so caption styling remains visible during adjustments.
 
 /// One row of the panel's Subtitles column — an mpv track (embedded or
 /// already-loaded external) or an add-on subtitle that loads on demand.
@@ -2304,12 +1438,35 @@ private func subtitlePanelOptions(for viewModel: PlayerViewModel) -> [SubtitlePa
     return options
 }
 
+@MainActor
+private func playerOrderedAudioTracks(_ viewModel: PlayerViewModel) -> [AudioTrack] {
+    func audioTrack(_ track: AudioTrack, matches language: String) -> Bool {
+        SubtitleLanguagePreferences.matches(track.language, target: language) ||
+        SubtitleLanguagePreferences.matches(track.languageName, target: language) ||
+        SubtitleLanguagePreferences.matches(track.name, target: language)
+    }
+
+    let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: viewModel.activeMeta)
+    return viewModel.audioTracks.enumerated().sorted { lhs, rhs in
+        let lhsPreferred = preferred.map { audioTrack(lhs.element, matches: $0) } ?? false
+        let rhsPreferred = preferred.map { audioTrack(rhs.element, matches: $0) } ?? false
+        if lhsPreferred != rhsPreferred { return lhsPreferred }
+
+        let lhsLanguage = lhs.element.languageName.isEmpty ? lhs.element.name : lhs.element.languageName
+        let rhsLanguage = rhs.element.languageName.isEmpty ? rhs.element.name : rhs.element.languageName
+        let comparison = lhsLanguage.localizedCaseInsensitiveCompare(rhsLanguage)
+        if comparison != .orderedSame { return comparison == .orderedAscending }
+        return lhs.offset < rhs.offset
+    }
+    .map(\.element)
+}
+
 struct PlayerSettingsPanel: View {
     @ObservedObject var viewModel: PlayerViewModel
     let didReportPlaybackStarted: Bool
     var onClose: () -> Void
 
-    private enum Tab: String, CaseIterable, Hashable {
+    enum Tab: String, CaseIterable, Hashable {
         case titles = "Titles"
         case subtitles = "Subtitles"
         case audio = "Audio"
@@ -2378,7 +1535,15 @@ struct PlayerSettingsPanel: View {
     private static let palette = ["#FFFFFF", "#C7C7C7", "#F2C94C", "#56CCF2", "#EB5757", "#6FCF97"]
     private static let backgroundPalette = ["#000000", "#303030", "#FFFFFF", "#1F3A5F", "#5A1F2B", "#214D35"]
 
-    @State private var tab: Tab = .subtitles
+    @State private var tab: Tab
+
+    init(viewModel: PlayerViewModel, didReportPlaybackStarted: Bool, initialTab: Tab, onClose: @escaping () -> Void) {
+        self.viewModel = viewModel
+        self.didReportPlaybackStarted = didReportPlaybackStarted
+        self.onClose = onClose
+        _tab = State(initialValue: initialTab)
+    }
+
     /// Gestures tab: the bindings, the action being recorded, and what the last change did.
     @State private var gestureBindings = PlayerGestureSettings.bindings()
     @State private var recordingGestureAction: PlayerGestureAction?
@@ -2516,7 +1681,7 @@ struct PlayerSettingsPanel: View {
             }
         }
         .onDisappear {
-            viewModel.setControlsAutoHideSuspended(false)
+            viewModel.setControlsAutoHideSuspended(viewModel.showPlayerDock)
         }
         .onChange(of: focus) { _, newValue in
             // Focusing a language filters the middle column live.
@@ -2525,7 +1690,7 @@ struct PlayerSettingsPanel: View {
             }
         }
         .onChange(of: tab) { _, newTab in
-            if newTab == .audio && orderedAudioTracks.isEmpty {
+            if newTab == .audio && playerOrderedAudioTracks(viewModel).isEmpty {
                 focus = .audioControl(.delayMinus)
             } else if newTab == .titles, let first = viewModel.discTitles.first {
                 focus = .discTitle(viewModel.selectedDiscTitleId ?? first.id)
@@ -2556,7 +1721,7 @@ struct PlayerSettingsPanel: View {
                 let isSelected = tab == item
                 Button {
                     tab = item
-                    if item == .audio && orderedAudioTracks.isEmpty {
+                    if item == .audio && playerOrderedAudioTracks(viewModel).isEmpty {
                         focus = .audioControl(.delayMinus)
                     } else if item == .titles, let first = viewModel.discTitles.first {
                         focus = .discTitle(viewModel.selectedDiscTitleId ?? first.id)
@@ -3439,7 +2604,7 @@ struct PlayerSettingsPanel: View {
             } else {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 14) {
-                        ForEach(orderedAudioTracks) { track in
+                        ForEach(playerOrderedAudioTracks(viewModel)) { track in
                             audioTrackCard(track)
                         }
                     }
@@ -3454,28 +2619,6 @@ struct PlayerSettingsPanel: View {
     /// Preferred audio first, followed by the remaining languages
     /// alphabetically. Preserve the stream's original order within a language
     /// so commentary/Atmos/stereo variants do not jump around unexpectedly.
-    private var orderedAudioTracks: [AudioTrack] {
-        let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: viewModel.activeMeta)
-        return viewModel.audioTracks.enumerated().sorted { lhs, rhs in
-            let lhsPreferred = preferred.map { audioTrack(lhs.element, matches: $0) } ?? false
-            let rhsPreferred = preferred.map { audioTrack(rhs.element, matches: $0) } ?? false
-            if lhsPreferred != rhsPreferred { return lhsPreferred }
-
-            let lhsLanguage = lhs.element.languageName.isEmpty ? lhs.element.name : lhs.element.languageName
-            let rhsLanguage = rhs.element.languageName.isEmpty ? rhs.element.name : rhs.element.languageName
-            let comparison = lhsLanguage.localizedCaseInsensitiveCompare(rhsLanguage)
-            if comparison != .orderedSame { return comparison == .orderedAscending }
-            return lhs.offset < rhs.offset
-        }
-        .map(\.element)
-    }
-
-    private func audioTrack(_ track: AudioTrack, matches language: String) -> Bool {
-        SubtitleLanguagePreferences.matches(track.language, target: language) ||
-        SubtitleLanguagePreferences.matches(track.languageName, target: language) ||
-        SubtitleLanguagePreferences.matches(track.name, target: language)
-    }
-
     private func audioTrackCard(_ track: AudioTrack) -> some View {
         let isFocused = focus == .audio(track.id)
         return Button {
@@ -4355,5 +3498,462 @@ struct PlayerPresetNameDialog: View {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolved = trimmed.isEmpty ? SubtitleStylePresetStore.shared.suggestedCustomPresetName() : trimmed
         onSave(resolved)
+    }
+}
+
+/// The dock's primary hubs. Speed is a shortcut into Tune.
+private enum PlayerDockTab: String, Hashable {
+    case subtitles = "Subtitles"
+    case audio = "Audio"
+    case sources = "Sources"
+    case episodes = "Episodes"
+    case info = "Info"
+    case tune = "Tune"
+    case speed = "Speed"
+}
+
+/// A right-anchored dock that keeps adjustments and track selection beside the playing video.
+private struct PlayerDock: View {
+    @ObservedObject var viewModel: PlayerViewModel
+    @Binding var tab: PlayerDockTab
+    let tabs: [PlayerDockTab]
+    let speedShortcut: Bool
+    let onExit: () -> Void
+
+    private enum Detail: String {
+        case subtitleTiming = "Subtitle Timing"
+        case presets = "Style Preset"
+        case audioOffset = "A/V Offset"
+        case aspect = "Aspect"
+        case logs = "Playback Logs"
+    }
+
+    @State private var detail: Detail?
+    @State private var cachedOnly = false
+    @FocusState private var focus: String?
+    @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
+    @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
+
+    private var activeHub: PlayerDockTab { tab == .speed ? .tune : tab }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack {
+                Text(detail?.rawValue ?? (tab == .info ? "Stream Info & Debug" : tab.rawValue))
+                    .font(.system(size: 27, weight: .bold))
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 8)
+                let telemetry = viewModel.playerTelemetry
+                let summary = tab == .info ? telemetry.engine : PlayerTelemetry.join([telemetry.fileSize, telemetry.audioValue])
+                if let summary {
+                    Text(summary)
+                        .font(.system(size: 16, weight: .semibold))
+                        .lineLimit(1)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(.white.opacity(0.12), in: Capsule())
+                }
+            }
+
+            HStack(spacing: 5) {
+                ForEach(tabs, id: \.self) { hub in
+                    let selected = activeHub == hub
+                    let focused = focus == hub.rawValue
+                    Button {
+                        detail = nil
+                        tab = hub
+                    } label: {
+                        Text(hub.rawValue)
+                            .font(.system(size: 17, weight: .semibold))
+                            .padding(.horizontal, 13)
+                            .padding(.vertical, 7)
+                            .foregroundStyle(selected || focused ? Color.playerGlassInk : .white)
+                            .background(selected || focused ? .white : .clear, in: Capsule())
+                            .overlay {
+                                if focused && selected {
+                                    Capsule().strokeBorder(Color.black.opacity(0.35), lineWidth: 2)
+                                }
+                            }
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focused($focus, equals: hub.rawValue)
+                    .focusEffectDisabledIfAvailable()
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                }
+            }
+            .padding(4)
+            .background(.white.opacity(0.09), in: Capsule())
+            .focusSection()
+
+            quickControls
+                .focusSection()
+
+            dockContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .padding(23)
+        .frame(width: 710, height: 556, alignment: .topLeading)
+        .modifier(PlayerGlassSurface(shape: RoundedRectangle(cornerRadius: 27), darkOpacity: 0.52))
+        .foregroundStyle(.white)
+        .focusSection()
+        .defaultFocus($focus, activeHub.rawValue)
+        .onAppear {
+            if !tabs.contains(activeHub) { tab = .tune }
+            if tab == .sources { viewModel.loadSourcesIfNeeded(force: true) }
+            focus = activeHub.rawValue
+        }
+        .onChange(of: tab) { _, value in
+            if value == .sources { viewModel.loadSourcesIfNeeded(force: true) }
+        }
+        .onChange(of: tabs) { _, available in
+            guard !available.contains(activeHub) else { return }
+            showHub()
+            tab = .tune
+            focus = PlayerDockTab.tune.rawValue
+        }
+        .onExitCommand {
+            if detail != nil || (tab == .speed && !speedShortcut) {
+                showHub()
+            } else {
+                onExit()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var quickControls: some View {
+        if detail == nil {
+            switch activeHub {
+            case .subtitles:
+                HStack(spacing: 9) {
+                    tile("Auto-Sync", subtitleSyncLabel, id: "subtitle-sync",
+                         action: runSubtitleSync)
+                        .disabled(viewModel.activeAddonSubtitle == nil)
+                    tile("Timing Shift", String(format: "%+.1f s", Double(viewModel.subtitleDelayMs) / 1000),
+                         id: "subtitle-timing") { openDetail(.subtitleTiming) }
+                    tile("Style Preset", SubtitleStylePresetStore.shared.activePresetTitle(for: viewModel.subtitleStyle),
+                         id: "subtitle-style") { openDetail(.presets) }
+                }
+            case .audio:
+                HStack(spacing: 9) {
+                    tile("Voice Profile", viewModel.enhanceDialogueMode.title, id: "audio-dialogue") {
+                        let modes = EnhanceDialogueMode.allCases
+                        let index = modes.firstIndex(of: viewModel.enhanceDialogueMode) ?? 0
+                        viewModel.setEnhanceDialogueMode(modes[(index + 1) % modes.count])
+                    }
+                    .disabled(!viewModel.supportsAudioProcessing)
+                    tile("Reduce Loud Sounds", viewModel.isReduceLoudSoundsActive ? "On" : "Off", id: "audio-night",
+                         action: viewModel.toggleReduceLoudSounds)
+                        .disabled(!viewModel.supportsAudioProcessing)
+                    tile("A/V Offset", "\(viewModel.audioDelayMs) ms", id: "audio-offset") { openDetail(.audioOffset) }
+                }
+            case .sources:
+                HStack(spacing: 9) {
+                    tile("Cached Only", cachedOnly ? "On" : "Off", id: "sources-cached") { cachedOnly.toggle() }
+                    tileLabel("Playing Quality", viewModel.playerTelemetry.quality ?? "Unavailable")
+                    tileLabel("Playing Size", viewModel.playerTelemetry.fileSize ?? "Unavailable")
+                }
+            case .tune:
+                HStack(spacing: 9) {
+                    tile("Speed", viewModel.playbackSpeed.dockLabel, id: "tune-speed") {
+                        tab = .speed
+                        focus = PlayerDockTab.tune.rawValue
+                    }
+                        .disabled(viewModel.isLiveStream)
+                    tile("Aspect", viewModel.aspectMode.label, id: "tune-aspect") { openDetail(.aspect) }
+                    tile("Gestures", "Configure", id: "tune-gestures") { openSettings(.gestures) }
+                }
+            case .info, .episodes, .speed:
+                EmptyView()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var dockContent: some View {
+        if detail == nil && tab == .sources {
+            PlayerSourcesPanel(viewModel: viewModel, embedded: true, cachedOnly: cachedOnly)
+        } else if detail == nil && tab == .episodes {
+            PlayerEpisodesPanel(viewModel: viewModel, embedded: true)
+        } else if detail == .logs {
+            PlaybackLogsPage()
+                .id("dock-logs")
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 7) {
+                    if let detail {
+                        detailRows(detail)
+                    } else {
+                        hubRows
+                    }
+                }
+            }
+            .focusSection()
+            .id(detail?.rawValue ?? tab.rawValue)
+        }
+    }
+
+    @ViewBuilder
+    private var hubRows: some View {
+        switch tab {
+        case .subtitles:
+            let options = subtitlePanelOptions(for: viewModel)
+            if let off = viewModel.subtitles.first(where: { $0.id == "off" }) {
+                row("Off", id: "subtitle-off", selected: off.isSelected) { viewModel.selectSubtitle(off) }
+            }
+            ForEach(options) { option in
+                let labels = switch option.kind {
+                case .track(let track) where track.externalFilename.isEmpty:
+                    SubtitleMenuFormatter.builtInMenuLabels(option: option)
+                default:
+                    SubtitleMenuFormatter.groupedExternalMenuLabels(option: option)
+                }
+                row(labels.title, subtitle: labels.subtitle, id: "subtitle-\(option.id)", selected: option.isSelected) {
+                    switch option.kind {
+                    case .track(let track): viewModel.selectSubtitle(track)
+                    case .external(let subtitle): viewModel.selectExternalSubtitle(subtitle)
+                    }
+                }
+            }
+            row("Subtitle Style & Tracks", id: "subtitle-settings") { openSettings(.subtitles) }
+        case .audio:
+            if viewModel.audioTracks.isEmpty {
+                Text("No audio tracks available").foregroundStyle(.white.opacity(0.7))
+            }
+            ForEach(playerOrderedAudioTracks(viewModel)) { track in
+                row(audioTrackTitle(for: track), subtitle: track.detail, id: "audio-\(track.id)",
+                    selected: track.isSelected) { viewModel.selectAudio(track) }
+            }
+            if loudnessNormalizer && viewModel.supportsAudioProcessing {
+                row("Loudness Target", subtitle: loudnessTargetTitle(loudnessTargetPreset), id: "audio-target") {
+                    switch loudnessTargetPreset {
+                    case "standard": loudnessTargetPreset = "night"
+                    case "night": loudnessTargetPreset = "boost"
+                    default: loudnessTargetPreset = "standard"
+                    }
+                    viewModel.updateLoudnessTarget()
+                }
+            }
+            row("Audio Output & Adjustments", id: "audio-settings") { openSettings(.audio) }
+        case .info:
+            streamTelemetryTiles
+            row("Stream Info & Debug HUD", trailing: viewModel.isPlaybackDebugEnabled ? "On" : "Off",
+                id: "debug-hud", selected: viewModel.isPlaybackDebugEnabled) {
+                viewModel.togglePlaybackDebugHUD()
+            }
+            row("Playback Logs", id: "debug-logs") { openDetail(.logs) }
+        case .tune:
+            row("Touch & Custom Gestures", id: "tune-gesture-settings") { openSettings(.gestures) }
+            row("Playback Settings", id: "tune-playback") { openSettings(.speed) }
+            if viewModel.discTitles.count > 1 {
+                row("Disc Titles", id: "tune-titles") { openSettings(.titles) }
+            }
+        case .speed:
+            ForEach(PlaybackSpeed.allCases) { speed in
+                row(speed.dockLabel, id: "speed-\(speed.id)", selected: speed == viewModel.playbackSpeed) {
+                    viewModel.setSpeed(speed)
+                }
+            }
+        case .sources, .episodes:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private func detailRows(_ detail: Detail) -> some View {
+        switch detail {
+        case .subtitleTiming:
+            row("Earlier by 0.2 s", id: "subtitle-earlier") { viewModel.setSubtitleDelayMs(viewModel.subtitleDelayMs - 200) }
+            row("Later by 0.2 s", id: "subtitle-later") { viewModel.setSubtitleDelayMs(viewModel.subtitleDelayMs + 200) }
+            row("Reset Timing", trailing: "\(viewModel.subtitleDelayMs) ms", id: "subtitle-reset") { viewModel.setSubtitleDelayMs(0) }
+            if let subtitle = viewModel.activeAddonSubtitle {
+                if let timing = viewModel.audioSyncTimingStatusForCurrentSubtitle,
+                   timing.originalDelayMs != timing.syncedDelayMs {
+                    row(timing.isOriginalTimingSelected ? "Synced Timing" : "Original Timing", id: "subtitle-audio-timing") {
+                        viewModel.toggleAudioSyncTiming()
+                    }
+                } else if viewModel.activeEngineKind == .aether || viewModel.audioSyncStatus?.isRunning == true {
+                    let isListening = viewModel.audioSyncStatus?.isRunning == true
+                        && viewModel.audioSyncStatus?.subtitleURL == subtitle.url
+                    row(isListening ? "Stop Listening" : "Sync by Audio", id: "subtitle-sync-audio") {
+                        if viewModel.isAudioSyncRunning && !isListening {
+                            viewModel.startAudioSync()
+                        } else {
+                            viewModel.toggleAudioSync()
+                        }
+                    }
+                }
+            }
+        case .presets:
+            let selected = SubtitleStylePresetStore.shared.activePreset(for: viewModel.subtitleStyle)?.id
+            ForEach(SubtitleStylePresetStore.shared.allPresets()) { preset in
+                row(preset.name, id: "preset-\(preset.id)", selected: preset.id == selected) {
+                    SubtitleStylePresetStore.shared.applyPreset(preset)
+                    viewModel.applySubtitleStyle()
+                }
+            }
+            row("Customize Style", id: "subtitle-custom-style") { openSettings(.subtitles) }
+        case .audioOffset:
+            row("Earlier by 50 ms", id: "audio-earlier") { viewModel.setAudioDelayMs(viewModel.audioDelayMs - 50) }
+            row("Later by 50 ms", id: "audio-later") { viewModel.setAudioDelayMs(viewModel.audioDelayMs + 50) }
+            row("Reset Offset", trailing: "\(viewModel.audioDelayMs) ms", id: "audio-reset") { viewModel.setAudioDelayMs(0) }
+        case .aspect:
+            ForEach(PlayerAspectMode.allCases) { mode in
+                row(mode.label, subtitle: mode.detail, id: "aspect-\(mode.id)", selected: mode == viewModel.aspectMode) {
+                    viewModel.setAspectMode(mode)
+                }
+            }
+        case .logs:
+            EmptyView()
+        }
+    }
+
+    /// Four compact readouts for the live stream and its output pipeline.
+    private var streamTelemetryTiles: some View {
+        let telemetry = viewModel.playerTelemetry
+        let bitrateAndBuffer = PlayerTelemetry.join([telemetry.bitrate, telemetry.buffer])
+        return VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                tileLabel("Video Stream", telemetry.videoStream ?? "Unavailable")
+                tileLabel("Audio Pipeline", telemetry.audioPipeline ?? telemetry.audio ?? "Unavailable")
+            }
+            HStack(spacing: 8) {
+                tileLabel("Dynamic Range", telemetry.dynamicRange ?? "Unavailable")
+                tileLabel("Bitrate / Buffer", bitrateAndBuffer ?? "Unavailable")
+            }
+        }
+    }
+
+    private var subtitleSyncLabel: String {
+        guard let subtitle = viewModel.activeAddonSubtitle else { return "Add-on subtitles only" }
+        switch viewModel.subtitleAutoSyncStates[subtitle.url] {
+        case .checking?: return "Checking…"
+        case .synced?: return viewModel.isSubtitleAutoSyncUsingOriginal(subtitle.url) ? "Original Timing" : "Synced"
+        case .kept(.inSync)?: return "In Sync"
+        default: return "Sync Subtitle"
+        }
+    }
+
+    private func runSubtitleSync() {
+        guard let subtitle = viewModel.activeAddonSubtitle else { return }
+        switch viewModel.subtitleAutoSyncStates[subtitle.url] {
+        case .checking?, .kept(.inSync)?: break
+        case .synced?: viewModel.toggleSubtitleAutoSyncTiming()
+        default: viewModel.runSubtitleAutoSyncNow()
+        }
+    }
+
+    private func loudnessTargetTitle(_ preset: String) -> String {
+        switch preset {
+        case "night": return "Night Listening (−20 LUFS)"
+        case "boost": return "Quiet Source Boost (−16 LUFS)"
+        default: return "Cinema / Standard (−24 LUFS)"
+        }
+    }
+
+    private func openSettings(_ tab: PlayerSettingsPanel.Tab) {
+        viewModel.initialPlayerSettingsTab = tab
+        viewModel.showSettingsPanel = true
+    }
+
+    private func openDetail(_ newDetail: Detail) {
+        detail = newDetail
+        focus = activeHub.rawValue
+    }
+
+    private func showHub() {
+        detail = nil
+        if tab == .speed { tab = .tune }
+        focus = activeHub.rawValue
+    }
+
+    private func tile(_ title: String, _ value: String, id: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { tileLabel(title, value, focused: focus == id) }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($focus, equals: id)
+            .focusEffectDisabledIfAvailable()
+    }
+
+    private func tileLabel(_ title: String, _ value: String, focused: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.system(size: 15, weight: .medium)).opacity(0.78)
+            Text(value).font(.system(size: 18, weight: .semibold))
+        }
+        .lineLimit(1)
+        .frame(maxWidth: .infinity, minHeight: 62, alignment: .leading)
+        .padding(.horizontal, 11)
+        .foregroundStyle(focused ? Color.playerGlassInk : .white)
+        .background(focused ? .white : .white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func row(
+        _ title: String, subtitle: String? = nil, trailing: String? = nil,
+        id: String, selected: Bool = false, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            PlayerPanelRow(
+                title: title, subtitle: subtitle, trailing: trailing, selected: selected,
+                isFocused: focus == id, emphasizesSelection: true
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focus, equals: id)
+        .focusEffectDisabledIfAvailable()
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+    private func audioTrackTitle(for track: AudioTrack) -> String {
+        let rawName = track.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawLang = track.language.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawLangName = track.languageName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let langIdentifier = !rawLang.isEmpty ? rawLang : rawLangName
+        let humanLanguage = SubtitleLanguagePreferences.humanLanguageName(from: langIdentifier)
+
+        // 1. If name is completely empty or just generic "Track 1" / "Track 2"
+        let isGenericTrack = rawName.isEmpty || rawName.range(of: #"^Track\s*\d+$"#, options: [.regularExpression, .caseInsensitive]) != nil
+        if isGenericTrack {
+            if !humanLanguage.isEmpty {
+                return humanLanguage
+            }
+            return rawName.isEmpty ? L10n.format("player_track_format", fallback: "Track %d", track.id) : rawName
+        }
+
+        // 2. If name is just the language code (e.g. "eng", "en", "fra", "nob")
+        if (!rawLang.isEmpty && rawName.caseInsensitiveCompare(rawLang) == .orderedSame) ||
+           (!rawLangName.isEmpty && rawName.caseInsensitiveCompare(rawLangName) == .orderedSame) {
+            return !humanLanguage.isEmpty ? humanLanguage : rawName.capitalized
+        }
+
+        // 3. If name starts with the language code (e.g. "eng (DTS-HD MA 5.1)", "eng [Original]", "eng - 5.1")
+        if !humanLanguage.isEmpty {
+            let codeToCheck = !rawLang.isEmpty ? rawLang : rawLangName
+            if !codeToCheck.isEmpty {
+                let pattern = #"^"# + NSRegularExpression.escapedPattern(for: codeToCheck) + #"\b[\s:_\-]*"#
+                if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                    let range = NSRange(rawName.startIndex..<rawName.endIndex, in: rawName)
+                    if let match = regex.firstMatch(in: rawName, options: [], range: range) {
+                        let startIndex = rawName.index(rawName.startIndex, offsetBy: match.range.length)
+                        let suffix = String(rawName[startIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if suffix.isEmpty {
+                            return humanLanguage
+                        } else if suffix.hasPrefix("(") || suffix.hasPrefix("[") {
+                            return "\(humanLanguage) \(suffix)"
+                        } else {
+                            return "\(humanLanguage) (\(suffix))"
+                        }
+                    }
+                }
+            }
+
+            // 4. If name already contains the full language name (e.g. "English (Original)")
+            if rawName.localizedCaseInsensitiveContains(humanLanguage) {
+                return rawName
+            }
+
+            // 5. If name is another descriptor without language (e.g. "Director's Commentary" or "DTS 5.1")
+            return "\(humanLanguage) (\(rawName))"
+        }
+
+        return rawName
     }
 }

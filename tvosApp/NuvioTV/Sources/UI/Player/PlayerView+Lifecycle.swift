@@ -353,12 +353,17 @@ extension PlayerView {
                     skipSegmentFocused = false
                 }
             }
+            .onChange(of: isDockSubtitlePreviewVisible) { _, visible in
+                guard viewModel.activeEngineKind == .mpv else { return }
+                viewModel.playerController.setDockSubtitlePreviewEnabled(visible)
+            }
             .onChange(of: viewModel.showPauseOverlay) { _, visible in
                 if visible {
                     nextEpisodeFocused = false
                     cancelAutoPlayFocused = false
                     skipSegmentFocused = false
-                    focusRemoteInput()
+                    remoteInputFocused = false
+                    if !viewModel.canShowPauseOverlay { focusRemoteInput() }
                 }
             }
             .onChange(of: viewModel.isScrubbing) { _, scrubbing in
