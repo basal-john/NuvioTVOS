@@ -9959,6 +9959,9 @@ struct TVHomeView: View {
             }
             if !isSameSections {
                 TVHomeDebugTrace.log("home.publishHomeSections updating store.sections count=\(visible.count)")
+                print("[HomeRows] \(visible.count) rows: " + visible.map { section in
+                    "\(section.title) <\(section.addonId ?? "-")> [\(section.items.prefix(3).map(\.name).joined(separator: ", "))]"
+                }.joined(separator: " | "))
                 store.sections = visible
                 // The snapshot is what the next launch seeds skeletons *from*, so only
                 // rows that actually resolved belong in it.
