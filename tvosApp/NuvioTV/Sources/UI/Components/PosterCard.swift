@@ -222,6 +222,13 @@ struct PosterCard: View {
     var cardIndex: Int? = nil
     var layoutMode: String = "Modern"
     var showPosterLabels: Bool = false
+    /// Details › More Like This: a star rating pill in the poster's bottom-left corner.
+    var ratingBadge: Double? = nil
+    /// Details › More Like This: a muted line under the title ("2021 · Movie"). Any non-nil
+    /// value, empty included, reserves the line so every card in a row keeps the same height.
+    var sublabel: String? = nil
+    /// Off where cards never expand to their backdrop, so focus never downloads one.
+    var preloadsLandscapeArtwork: Bool = true
     var smoothFocusAnimations: Bool = true
     var focusHighlighterEnabled: Bool = false
     /// Keeps the last-selected card visually outlined while an overlay owns
@@ -524,6 +531,11 @@ struct PosterCard: View {
                         WatchedCheckmarkBadge(meta: meta)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     }
+                    if !effectiveLandscape, let ratingBadge, ratingBadge > 0 {
+                        PosterRatingPill(rating: ratingBadge)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                    }
                 }
             }
             // Mask the complete card interior after composing both the trailer
@@ -555,9 +567,20 @@ struct PosterCard: View {
                 )
                 .frame(width: cardWidth, alignment: .leading)
             }
+
+            if let sublabel {
+                Text(sublabel)
+                    .font(.appFont(size: 17, weight: .regular))
+                    .foregroundColor(.white.opacity(0.56))
+                    .lineLimit(1)
+                    .frame(width: cardWidth, height: Self.sublabelHeight, alignment: .leading)
+                    .padding(.top, -6)
+            }
         }
         .frame(width: layoutWidth, height: totalCardHeight, alignment: .topLeading)
     }
+
+    private static let sublabelHeight: CGFloat = 24
 
     // MARK: - Helper Views
 
@@ -899,7 +922,7 @@ struct PosterCard: View {
     }
 
     private var totalCardHeight: CGFloat {
-        cardHeight + (showsPosterTitle ? 36 : 0)
+        cardHeight + (showsPosterTitle ? 36 : 0) + (sublabel != nil ? Self.sublabelHeight + 3 : 0)
     }
 
     private var landscapeLogoWidth: CGFloat {
@@ -998,7 +1021,7 @@ struct PosterCard: View {
     }
 
     private var landscapePreloadURL: String? {
-        guard !effectiveLandscape else { return nil }
+        guard !effectiveLandscape, preloadsLandscapeArtwork || isLandscape else { return nil }
         return landscapePreloadArmed || isLandscape ? landscapeArtworkURL : nil
     }
 
@@ -1194,6 +1217,9 @@ extension PosterCard: Equatable {
             && (lhs.onRemoveFromContinueWatching != nil) == (rhs.onRemoveFromContinueWatching != nil)
             && lhs.layoutMode == rhs.layoutMode
             && lhs.showPosterLabels == rhs.showPosterLabels
+            && lhs.ratingBadge == rhs.ratingBadge
+            && lhs.sublabel == rhs.sublabel
+            && lhs.preloadsLandscapeArtwork == rhs.preloadsLandscapeArtwork
             && lhs.smoothFocusAnimations == rhs.smoothFocusAnimations
             && lhs.focusHighlighterEnabled == rhs.focusHighlighterEnabled
             && lhs.retainFocusAppearance == rhs.retainFocusAppearance
@@ -4014,5 +4040,28 @@ extension View {
                 onRefreshCatalog: onRefreshCatalog
             )
         )
+    }
+}
+
+/// A compact star rating drawn on a poster: solid dark fill and a hairline, no blur, so a
+/// row of them scrolls without extra render passes.
+struct PosterRatingPill: View {
+    let rating: Double
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "star.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Color(red: 1.0, green: 0.80, blue: 0.30))
+            Text(String(format: "%.1f", rating))
+                .font(.system(size: 16, weight: .semibold).monospacedDigit())
+                .foregroundColor(.white)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(Color.black.opacity(0.76)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 1))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(String(format: "Rated %.1f", rating))
     }
 }

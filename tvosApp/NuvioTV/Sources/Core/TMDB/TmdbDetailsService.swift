@@ -27,6 +27,8 @@ struct TmdbPersonMetadata: Identifiable, Equatable, Hashable {
 
     /// The role shown for a series' creators (TMDB's "created by").
     static let creatorRole = "Creator"
+    /// The role of a director who is also credited as a writer of the same title.
+    static let directorWriterRole = "Director & Writer"
 
     var id: String { tmdbId.map(String.init) ?? name }
     let name: String
@@ -45,6 +47,9 @@ struct TmdbPersonMetadata: Identifiable, Equatable, Hashable {
         case .creator:
             return L10n.string("details_person_creator", fallback: "Creator")
         case .director:
+            if role == Self.directorWriterRole {
+                return L10n.string("details_director_writer", fallback: "Director & Writer")
+            }
             return L10n.string("details_director", fallback: "Director")
         case .cast, nil:
             let trimmed = role?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -478,13 +483,14 @@ enum TmdbDetailsService {
         )
 
         let creatorPeople = await fetchCreators(for: resolved)
+        let writerNames = Set(writers)
         let directorPeople = (decoded.crew ?? [])
             .filter { $0.job?.caseInsensitiveCompare("Director") == .orderedSame }
             .compactMap { person -> TmdbPersonMetadata? in
                 guard let name = nonEmpty(person.name) else { return nil }
                 return TmdbPersonMetadata(
                     name: name,
-                    role: "Director",
+                    role: writerNames.contains(name) ? TmdbPersonMetadata.directorWriterRole : "Director",
                     profileURL: imageURL(person.profilePath, size: "w500"),
                     tmdbId: person.id,
                     credit: .director

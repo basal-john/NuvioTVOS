@@ -4718,7 +4718,6 @@ struct TvDetailsContent: View {
     let onBack: () -> Void
 
     @FocusState private var actionFocus: DetailsActionFocus?
-    @FocusState private var castHeaderFocus: DetailsCastHeaderFocus?
     @FocusState private var relatedCardFocus: String?
     @FocusState private var castCardFocus: String?
     @FocusState private var networkCardFocus: String?
@@ -4902,7 +4901,7 @@ struct TvDetailsContent: View {
     }
 
     private var isScrolledDown: Bool {
-        focusedDetailsSection != .actions || isEpisodeFocused || castHeaderFocus != nil || scrollOffset > 30
+        focusedDetailsSection != .actions || isEpisodeFocused || scrollOffset > 30
     }
 
     private var backdropBlurRadius: CGFloat {
@@ -5155,11 +5154,7 @@ struct TvDetailsContent: View {
                             uiState.people.isEmpty
                         )
                     },
-                    onTrailerClick: {
-                        presentFullscreenTrailer()
-                    },
                     onBack: handleDetailsBack,
-                    headerFocus: $castHeaderFocus,
                     entryLocked: focusedDetailsSection != .cast,
                     onFocus: {
                         guard focusRestoreAttemptTarget == nil else { return }
@@ -5580,14 +5575,6 @@ struct TvDetailsContent: View {
                             transaction.disablesAnimations = true
                             withTransaction(transaction) {
                                 scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
-                            }
-                        }
-                        .onChange(of: castHeaderFocus) { _, newFocus in
-                            guard newFocus != nil, focusRestoreAttemptTarget == nil else { return }
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
                             }
                         }
                         .onChange(of: isEpisodeFocused) { _, focused in
@@ -6170,18 +6157,21 @@ struct TvDetailsContent: View {
         }
     }
 
-    /// Episodes enter the next section through its heading, matching the
-    /// Settings-style focus graph instead of jumping over it to a person card.
-    private func focusCastHeaderFromEpisodes() {
-        guard hasCastOrTrailer else { return }
+    /// Moves focus from Episodes onto the first Cast & Crew card. The section heading is plain
+    /// text, so the row is unlocked first and the card is focused once it is enabled.
+    private func focusCastFromEpisodes() {
+        guard let firstPersonID = displayedCastPeople.first?.id else { return }
         detailsFocusMoveGeneration &+= 1
         let generation = detailsFocusMoveGeneration
         pendingPlayFocusGeneration = nil
-        castHeaderFocus = .creatorAndCast
+        focusedDetailsSection = .cast
+        castCardFocus = firstPersonID
 
         DispatchQueue.main.async {
             guard detailsFocusMoveGeneration == generation else { return }
-            castHeaderFocus = .creatorAndCast
+            if castCardFocus != firstPersonID {
+                castCardFocus = firstPersonID
+            }
         }
     }
 
@@ -6207,7 +6197,7 @@ struct TvDetailsContent: View {
         case .actions:
             focusPlayFromEpisodes(using: scrollProxy)
         case .cast:
-            focusCastHeaderFromEpisodes()
+            focusCastFromEpisodes()
             withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                 scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
             }
@@ -6229,7 +6219,7 @@ struct TvDetailsContent: View {
         let targetSection = detailsFocusOrder[currentIndex + 1]
         switch targetSection {
         case .cast:
-            focusCastHeaderFromEpisodes()
+            focusCastFromEpisodes()
             withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                 scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
             }
@@ -7074,10 +7064,6 @@ private enum DetailsActionFocus: Hashable {
     case play, shuffle, party, watchlist, watched, rate, anilist, mal, trailer, more
 }
 
-private enum DetailsCastHeaderFocus: Hashable {
-    case creatorAndCast, trailer
-}
-
 private struct TvDetailsActionRow: View {
     let metaName: String
     let isInWatchlist: Bool
@@ -7183,6 +7169,23 @@ private struct TvDetailsActionRow: View {
                     focus: focus,
                     tag: .watched,
                     action: onWatchedClick,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+
+                TvDetailsActionButton(
+                    title: L10n.string("details_trailer", fallback: "Trailer"),
+                    systemName: "play.rectangle",
+                    accessibilityLabel: L10n.string("details_trailer", fallback: "Trailer"),
+                    accessibilityHint: L10n.string("details_trailer_hint", fallback: "Plays the trailer full screen"),
+                    isPrimary: false,
+                    fillWidth: true,
+                    height: 72,
+                    cornerRadius: 18,
+                    focus: focus,
+                    tag: .trailer,
+                    action: onTrailerClick,
                     onFocus: onFocus,
                     onBack: onBack
                 )
@@ -7549,7 +7552,7 @@ private struct TvDetailsActionButton: View {
                 }
             }
             .foregroundColor(foregroundColor)
-            .padding(.horizontal, fixedWidth != nil ? 0 : (isPrimary ? 28 : 18))
+            .padding(.horizontal, fixedWidth != nil ? 0 : (isPrimary ? 28 : 14))
             .frame(
                 minWidth: fixedWidth ?? (isPrimary ? 228 : 98),
                 maxWidth: fixedWidth ?? (fillWidth ? .infinity : nil),
@@ -7927,9 +7930,7 @@ private struct TvDetailsCastAndTrailer: View {
     var onUnmounted: (() -> Void)? = nil
     var onPersonFocus: ((TmdbPersonMetadata) -> Void)? = nil
     let onPersonClick: (TmdbPersonMetadata) -> Void
-    let onTrailerClick: () -> Void
     var onBack: (() -> Void)? = nil
-    var headerFocus: FocusState<DetailsCastHeaderFocus?>.Binding
     let entryLocked: Bool
     let onFocus: () -> Void
 
@@ -7938,37 +7939,15 @@ private struct TvDetailsCastAndTrailer: View {
     var body: some View {
         let items = displayPeople
         if !items.isEmpty {
-            VStack(alignment: .leading, spacing: 28) {
-                HStack(spacing: 18) {
-                    TvDetailsSectionButton(
-                        title: DetailsCastHeaderLabel.title(for: mediaType),
-                        isSelected: false,
-                        focus: headerFocus,
-                        tag: .creatorAndCast,
-                        onFocus: onFocus,
-                        onBack: onBack
-                    ) {}
-                    .disabled(focusRequestID != nil)
-
-                    Text("|")
-                        .font(.system(size: 36, weight: .medium))
-                        .foregroundColor(.white.opacity(0.38))
-
-                    TvDetailsSectionButton(
-                        title: L10n.string("details_trailer", fallback: "Trailer"),
-                        isSelected: false,
-                        focus: headerFocus,
-                        tag: .trailer,
-                        onFocus: onFocus,
-                        onBack: onBack,
-                        action: onTrailerClick
-                    )
-                        .disabled(entryLocked || focusRequestID != nil)
-                }
+            VStack(alignment: .leading, spacing: 22) {
+                Text(L10n.string("details_cast_and_crew", fallback: "Cast & Crew"))
+                    .font(.system(size: 34, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.92))
+                    .accessibilityAddTraits(.isHeader)
 
                 ScrollViewReader { scrollProxy in
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 58) {
+                        LazyHStack(alignment: .top, spacing: 24) {
                             ForEach(Array(items.enumerated()), id: \.element.id) { index, person in
                                 TvDetailsPersonCard(
                                     person: person,
@@ -7982,9 +7961,13 @@ private struct TvDetailsCastAndTrailer: View {
                                     onBack: onBack
                                 )
                                 .id(person.id)
-                                .disabled(focusRequestID.map { $0 != person.id } ?? entryLocked)
+                                .disabled(
+                                    focusRequestID.map { $0 != person.id }
+                                        ?? (entryLocked && index != entryIndex(in: items))
+                                )
                             }
                         }
+                        .padding(.vertical, 18)
                         .padding(.trailing, 80)
                     }
                     .scrollClipDisabledIfAvailable()
@@ -8014,45 +7997,16 @@ private struct TvDetailsCastAndTrailer: View {
         people
     }
 
+    /// The one card that stays focusable while the row is locked, so a D-pad move into the
+    /// section lands on the last focused person, or the first one on a fresh visit.
+    private func entryIndex(in items: [TmdbPersonMetadata]) -> Int {
+        items.indices.contains(focusedPersonIndex) ? focusedPersonIndex : 0
+    }
+
     private func positionAtRequestedItem(using scrollProxy: ScrollViewProxy) {
         guard let focusRequestID,
               people.contains(where: { $0.id == focusRequestID }) else { return }
         scrollProxy.scrollTo(focusRequestID, anchor: .center)
-    }
-}
-
-private struct TvDetailsSectionButton: View {
-    let title: String
-    let isSelected: Bool
-    var focus: FocusState<DetailsCastHeaderFocus?>.Binding
-    let tag: DetailsCastHeaderFocus
-    let onFocus: () -> Void
-    var onBack: (() -> Void)? = nil
-    let action: () -> Void
-
-    private var isFocused: Bool { focus.wrappedValue == tag }
-
-    var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 36, weight: .semibold))
-                .foregroundColor(.white.opacity(isFocused || isSelected ? 1 : 0.48))
-                .padding(.horizontal, isSelected ? 0 : 4)
-                .frame(height: 64)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focused(focus, equals: tag)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.035 : 1)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { _, focused in
-            if focused {
-                onFocus()
-            }
-        }
-        .onExitCommand {
-            onBack?()
-        }
     }
 }
 
@@ -8077,8 +8031,9 @@ private struct TvDetailsRelatedRow: View {
     let onFocus: () -> Void
 
     @State private var scrollIndex = 0
+    @State private var previewItem: RelatedTitle?
+    @State private var previewTask: Task<Void, Never>?
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
-    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
 
@@ -8087,14 +8042,15 @@ private struct TvDetailsRelatedRow: View {
     private var spacing: CGFloat { homeLayout == "Compact" ? 22 : 28 }
     private var step: CGFloat { cardWidth + spacing }
     private var stripHeight: CGFloat {
-        cardHeight + 36 + TvDetailsHorizontalStrip.verticalPadding * 2
+        cardHeight + 36 + 27 + TvDetailsHorizontalStrip.verticalPadding * 2
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             Text(title)
                 .font(.system(size: 34, weight: .semibold))
-                .foregroundColor(.white.opacity(0.9))
+                .foregroundColor(.white.opacity(0.92))
+                .accessibilityAddTraits(.isHeader)
 
             HStack(alignment: .bottom, spacing: spacing) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
@@ -8105,11 +8061,15 @@ private struct TvDetailsRelatedRow: View {
                             if scrollIndex != index { scrollIndex = index }
                             onFocus()
                             onItemFocus?(item)
+                            schedulePreview(of: item)
                         },
                         externalFocus: externalFocus,
                         externalFocusValue: item.id,
                         layoutMode: homeLayout,
-                        showPosterLabels: posterLabels,
+                        showPosterLabels: true,
+                        ratingBadge: item.rating,
+                        sublabel: Self.sublabel(for: item),
+                        preloadsLandscapeArtwork: false,
                         smoothFocusAnimations: smoothFocus,
                         focusHighlighterEnabled: focusHighlighter
                     ) {
@@ -8130,6 +8090,8 @@ private struct TvDetailsRelatedRow: View {
                 smoothFocus ? TvDetailsHorizontalStrip.scrollSpring : nil,
                 value: scrollIndex
             )
+
+            previewStrip
         }
         .focusSection()
         .onExitCommand {
@@ -8146,8 +8108,57 @@ private struct TvDetailsRelatedRow: View {
             positionAtRequestedItem()
         }
         .onDisappear {
+            previewTask?.cancel()
             onUnmounted?()
         }
+    }
+
+    /// One quiet line about the focused title, at a fixed height so it never moves the page.
+    private var previewStrip: some View {
+        Text(previewText ?? " ")
+            .font(.appFont(size: 18, weight: .regular))
+            .foregroundColor(.white.opacity(0.56))
+            .lineLimit(1)
+            .frame(height: 26, alignment: .leading)
+            .frame(maxWidth: 1600, alignment: .leading)
+            .padding(.top, -10)
+            .accessibilityHidden(previewText == nil)
+    }
+
+    private var previewText: String? {
+        guard let previewItem else { return nil }
+        let heading = previewItem.year.map { "\(previewItem.name) (\($0))" } ?? previewItem.name
+        guard let overview = previewItem.overview?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !overview.isEmpty else {
+            return heading
+        }
+        return "\(heading) · \(overview)"
+    }
+
+    /// Updates the preview line 100 ms after focus rests, so holding the D-pad across the row
+    /// redraws it once instead of on every card passed.
+    private func schedulePreview(of item: RelatedTitle) {
+        previewTask?.cancel()
+        previewTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard !Task.isCancelled, previewItem?.id != item.id else { return }
+            previewItem = item
+        }
+    }
+
+    /// "2021 · Movie" under the poster. Empty when neither is known, which still keeps the line.
+    static func sublabel(for item: RelatedTitle) -> String {
+        let year = item.year?.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4)
+        let kind: String?
+        switch item.type.lowercased() {
+        case "movie": kind = L10n.string("type_movie", fallback: "Movie")
+        case "series", "tv": kind = L10n.string("type_series", fallback: "Series")
+        default: kind = nil
+        }
+        return [year.map(String.init), kind]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
     }
 
     private func positionAtRequestedItem() {
@@ -9397,48 +9408,51 @@ private struct TvDetailsPersonCard: View {
         externalFocus?.wrappedValue == person.id || localFocusID == person.id
     }
 
+    private static let cardWidth: CGFloat = 210
+    private static let cardHeight: CGFloat = 280
+
+    private var isCrew: Bool {
+        person.credit == .creator || person.credit == .director
+    }
+
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
         Button(action: onSelect) {
-            VStack(spacing: 18) {
-                Circle()
-                    .frame(width: 188, height: 188)
-                    .modifier(TvDetailsGlassBackground(filled: isFocused, shape: Circle()))
+            VStack(alignment: .leading, spacing: 14) {
+                portrait
+                    .frame(width: Self.cardWidth, height: Self.cardHeight)
+                    .clipShape(shape)
                     .overlay(
-                        Circle()
-                            .strokeBorder(Color.white.opacity(isFocused ? 0.0 : 0.22), lineWidth: 1)
+                        shape.strokeBorder(
+                            Color.white.opacity(isFocused ? 0.92 : 0.14),
+                            lineWidth: isFocused ? 3 : 1
+                        )
                     )
-                    .overlay {
-                        if let profileImage {
-                            Image(uiImage: profileImage)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 188, height: 188)
-                                .clipShape(Circle())
-                        } else {
-                            Text(initials)
-                                .font(.system(size: 44, weight: .medium))
-                                .foregroundColor(isFocused ? .black : .white)
-                        }
+                    .shadow(color: .black.opacity(isFocused ? 0.45 : 0), radius: 14, y: 8)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    MarqueeText(person.name, size: 22, weight: .semibold,
+                                color: .white.opacity(isFocused ? 1.0 : 0.92), isActive: isFocused, alignment: .leading)
+                        .frame(width: Self.cardWidth, alignment: .leading)
+
+                    if let role = captionRole {
+                        Text(role)
+                            .font(.appFont(size: 18, weight: .regular))
+                            .foregroundColor(.white.opacity(isFocused ? 0.80 : 0.62))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(width: Self.cardWidth, alignment: .topLeading)
                     }
-
-                MarqueeText(person.name, size: 24, weight: .medium,
-                            color: isFocused ? .white : .white.opacity(0.74), isActive: isFocused, alignment: .center)
-                    .frame(width: 210)
-
-                if let role = person.displayRole {
-                    Text(role)
-                        .font(.system(size: 20, weight: .regular))
-                        .foregroundColor(.white.opacity(isFocused ? 0.82 : 0.55))
-                        .lineLimit(1)
-                        .frame(width: 210)
                 }
+                .frame(width: Self.cardWidth, height: 76, alignment: .topLeading)
             }
-            .frame(width: 220)
+            .frame(width: Self.cardWidth, alignment: .leading)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused(externalFocus ?? $localFocusID, equals: person.id)
         .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.08 : 1)
+        .scaleEffect(isFocused ? 1.055 : 1, anchor: .top)
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .onChange(of: isFocused) { _, focused in
             if focused {
@@ -9450,6 +9464,66 @@ private struct TvDetailsPersonCard: View {
         }
         .task(id: person.profileURL) {
             await loadProfileImage()
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel([person.name, person.displayRole].compactMap { $0 }.joined(separator: ", "))
+        .accessibilityAddTraits(.isButton)
+    }
+
+    /// The photo framed from the top so heads stay in view, with a bottom scrim and the crew
+    /// badge. Solid fills only: blur on every card drops frames while the row scrolls.
+    @ViewBuilder
+    private var portrait: some View {
+        ZStack(alignment: .topLeading) {
+            if let profileImage {
+                Color(white: 0.10)
+                Image(uiImage: profileImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: Self.cardWidth, height: Self.cardHeight, alignment: .top)
+                    .clipped()
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.65),
+                        .init(color: .black.opacity(0.42), location: 1.0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            } else {
+                Color(white: 0.11)
+                Text(initials)
+                    .font(.system(size: 42, weight: .medium))
+                    .foregroundColor(.white.opacity(0.86))
+                    .frame(width: Self.cardWidth, height: Self.cardHeight)
+            }
+
+            if isCrew, let role = crewBadge {
+                Text(role)
+                    .font(.appFont(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(Color.black.opacity(0.68)))
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.22), lineWidth: 1))
+                    .padding(10)
+            }
+        }
+    }
+
+    /// The line under the name. A crew role that only repeats the badge is left out.
+    private var captionRole: String? {
+        guard let role = person.displayRole else { return nil }
+        return isCrew && role == crewBadge ? nil : role
+    }
+
+    /// The short crew label on the badge: "Director" or "Creator", never the full job list.
+    private var crewBadge: String? {
+        switch person.credit {
+        case .director: return L10n.string("details_director", fallback: "Director")
+        case .creator: return L10n.string("details_person_creator", fallback: "Creator")
+        default: return nil
         }
     }
 
@@ -9488,7 +9562,7 @@ private struct TvDetailsPersonCard: View {
         // Decoded off the main thread: a cast row's photos decoded there held Details up for
         // over a hundred milliseconds while it opened.
         let downsampledImage = await Task.detached(priority: .userInitiated) {
-            Self.downsampledProfileImage(from: data, maxPixelSize: 376)
+            Self.downsampledProfileImage(from: data, maxPixelSize: 580)
         }.value
 
         guard let image = downsampledImage, !Task.isCancelled else { return }
