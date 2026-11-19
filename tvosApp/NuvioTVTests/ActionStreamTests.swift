@@ -156,3 +156,138 @@ final class ActionStreamTests: XCTestCase {
         XCTAssertNil(tags.releaseFingerprint)
     }
 }
+
+@MainActor
+final class SmartPlaybackTorBoxPreferenceTests: XCTestCase {
+    func testSmartSelectorPrefersTorBoxAtSameResolution() {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.preferTorBoxStreams)
+        defer { defaults.set(previous, forKey: SettingsKey.preferTorBoxStreams) }
+        defaults.removeObject(forKey: SettingsKey.preferTorBoxStreams)
+
+        let realDebrid = NuvioStream(
+            url: "https://proxy.example/rd/movie.mkv",
+            name: "Hollow Man (2000) · RD",
+            description: "BluRay REMUX · 1080p · TrueHD 5.1 · 25 GB",
+            addonName: "AIOStreams"
+        )
+        let torBox = NuvioStream(
+            url: "https://proxy.example/tb/movie.mkv",
+            name: "Hollow Man (2000) · TB",
+            description: "BluRay · 1080p · 10bit · TrueHD 5.1 · 8.94 GB",
+            addonName: "AIOStreams"
+        )
+
+        let ranked = SmartPlaybackSelector.rankedStreams(
+            from: [realDebrid, torBox],
+            qualityPreference: "Highest",
+            subtitleLanguages: [],
+            shouldMatchSubtitles: false
+        )
+        XCTAssertEqual(ranked.first?.id, torBox.id)
+
+        defaults.set(false, forKey: SettingsKey.preferTorBoxStreams)
+        let unboosted = SmartPlaybackSelector.rankedStreams(
+            from: [realDebrid, torBox],
+            qualityPreference: "Highest",
+            subtitleLanguages: [],
+            shouldMatchSubtitles: false
+        )
+        XCTAssertEqual(unboosted.first?.id, realDebrid.id)
+    }
+
+    func testSmartSelectorKeepsHigherResolutionOverTorBox() {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.preferTorBoxStreams)
+        defer { defaults.set(previous, forKey: SettingsKey.preferTorBoxStreams) }
+        defaults.removeObject(forKey: SettingsKey.preferTorBoxStreams)
+
+        let realDebrid4K = NuvioStream(
+            url: "https://proxy.example/rd/movie.mkv",
+            name: "Movie (2020) · RD",
+            description: "WEB-DL · 2160p · HEVC · 15 GB",
+            addonName: "AIOStreams"
+        )
+        let torBox1080 = NuvioStream(
+            url: "https://proxy.example/tb/movie.mkv",
+            name: "Movie (2020) · TB",
+            description: "WEB-DL · 1080p · HEVC · 6 GB",
+            addonName: "AIOStreams"
+        )
+
+        let ranked = SmartPlaybackSelector.rankedStreams(
+            from: [torBox1080, realDebrid4K],
+            qualityPreference: "Highest",
+            subtitleLanguages: [],
+            shouldMatchSubtitles: false
+        )
+        XCTAssertEqual(ranked.first?.id, realDebrid4K.id)
+    }
+
+    func testTopResultPoolMovesTorBoxAheadWithinResolutionOnly() {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.preferTorBoxStreams)
+        defer { defaults.set(previous, forKey: SettingsKey.preferTorBoxStreams) }
+        defaults.removeObject(forKey: SettingsKey.preferTorBoxStreams)
+
+        let rd4K = NuvioStream(url: "https://p/1", name: "Movie · RD", description: "WEB-DL · 2160p", addonName: "A")
+        let tb1080 = NuvioStream(url: "https://p/2", name: "Movie · TB", description: "BluRay · 1080p", addonName: "A")
+        let rd1080 = NuvioStream(url: "https://p/3", name: "Movie · RD", description: "BluRay REMUX · 1080p", addonName: "A")
+        let tb1080b = NuvioStream(url: "https://p/4", name: "Movie · TB", description: "WEB-DL · 1080p", addonName: "A")
+
+        let reordered = SmartPlaybackSelector.preferringTorBox([rd4K, rd1080, tb1080, tb1080b])
+        XCTAssertEqual(reordered.map(\.id), [rd4K.id, tb1080.id, tb1080b.id, rd1080.id])
+
+        let aio1080 = NuvioStream(url: "https://p/5", name: "Movie · AIO", description: "BluRay REMUX · 1080p", addonName: "A")
+        XCTAssertEqual(SmartPlaybackSelector.preferringTorBox([aio1080, rd4K, tb1080]).map(\.id), [aio1080.id, rd4K.id, tb1080.id])
+        XCTAssertEqual(SmartPlaybackSelector.preferringTorBox([aio1080, rd1080, tb1080]).map(\.id), [tb1080.id, aio1080.id, rd1080.id])
+
+        defaults.set(false, forKey: SettingsKey.preferTorBoxStreams)
+        XCTAssertEqual(SmartPlaybackSelector.preferringTorBox([rd4K, rd1080, tb1080]).map(\.id), [rd4K.id, rd1080.id, tb1080.id])
+    }
+
+    func testRememberedMovieReleaseGivesWayToTorBoxButSeriesKeepsIt() {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.preferTorBoxStreams)
+        defer { defaults.set(previous, forKey: SettingsKey.preferTorBoxStreams) }
+        defaults.removeObject(forKey: SettingsKey.preferTorBoxStreams)
+
+        let remembered = NuvioStream(url: "https://p/1", name: "Movie · RD", description: "BluRay REMUX · 1080p", addonName: "A")
+        let tb1080 = NuvioStream(url: "https://p/2", name: "Movie · TB", description: "BluRay · 1080p", addonName: "A")
+        let tb720 = NuvioStream(url: "https://p/3", name: "Movie · TB", description: "WEB-DL · 720p", addonName: "A")
+        let pool = [remembered, tb1080, tb720]
+
+        XCTAssertEqual(SmartPlaybackSelector.fasterEquivalent(of: remembered, in: pool, isSeries: false)?.id, tb1080.id)
+        XCTAssertEqual(SmartPlaybackSelector.fasterEquivalent(of: remembered, in: pool, isSeries: true)?.id, remembered.id)
+        XCTAssertEqual(SmartPlaybackSelector.fasterEquivalent(of: remembered, in: [remembered, tb720], isSeries: false)?.id, remembered.id)
+        XCTAssertNil(SmartPlaybackSelector.fasterEquivalent(of: nil, in: pool, isSeries: false))
+    }
+
+    func testTorBoxNeverLiftsLowerResolutionUnderAnyPreference() {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.preferTorBoxStreams)
+        defer { defaults.set(previous, forKey: SettingsKey.preferTorBoxStreams) }
+        defaults.removeObject(forKey: SettingsKey.preferTorBoxStreams)
+
+        let rd1080 = NuvioStream(url: "https://p/1", name: "Movie · RD", description: "BluRay · 1080p", addonName: "A")
+        let tb720 = NuvioStream(url: "https://p/2", name: "Movie · TB", description: "WEB-DL · 720p", addonName: "A")
+        for preference in ["Highest", "4K", "1080p"] {
+            let ranked = SmartPlaybackSelector.rankedStreams(
+                from: [tb720, rd1080],
+                qualityPreference: preference,
+                subtitleLanguages: [],
+                shouldMatchSubtitles: false
+            )
+            XCTAssertEqual(ranked.first?.id, rd1080.id, preference)
+        }
+    }
+
+    func testTorBoxDetectionIgnoresOtherServicesAndSizes() {
+        XCTAssertTrue(SmartPlaybackSelector.isTorBoxStream(NuvioStream(url: "https://x/a", name: "Movie · TB", description: nil, addonName: "A")))
+        XCTAssertTrue(SmartPlaybackSelector.isTorBoxStream(NuvioStream(url: "https://x/a", name: "[TB+] Movie 1080p", description: nil, addonName: "A")))
+        XCTAssertTrue(SmartPlaybackSelector.isTorBoxStream(NuvioStream(url: "https://x/a", name: "Movie", description: "TorBox cached", addonName: "A")))
+        XCTAssertFalse(SmartPlaybackSelector.isTorBoxStream(NuvioStream(url: "https://x/a", name: "Movie · RD", description: nil, addonName: "A")))
+        XCTAssertFalse(SmartPlaybackSelector.isTorBoxStream(NuvioStream(url: "https://x/a", name: "Movie · AIO", description: nil, addonName: "A")))
+        XCTAssertFalse(SmartPlaybackSelector.isTorBoxStream(NuvioStream(url: "https://x/a", name: "TBS Special 1080p", description: nil, addonName: "A")))
+    }
+}

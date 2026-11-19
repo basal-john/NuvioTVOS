@@ -1479,6 +1479,15 @@ struct ContentView: View {
             return
         }
 
+        if host == "home-addon" {
+            if let addonID = components?.queryItems?.first(where: { $0.name == "id" })?.value, !addonID.isEmpty {
+                let show = components?.queryItems?.first(where: { $0.name == "show" })?.value != "0"
+                TVHomeCatalogOrder.setHomeHidden(!show, addonID: addonID)
+                print("[HomeAddon] \(show ? "shown" : "hidden"), \(TVHomeCatalogOrder.homeHiddenAddonIDs().count) add-on(s) hidden on Home")
+            }
+            return
+        }
+
         let id = components?.queryItems?.first(where: { $0.name == "id" })?.value
             ?? pathParts.dropFirst().first
         guard let id, !id.isEmpty else { return }
@@ -11760,8 +11769,25 @@ enum TVHomeCatalogOrder {
 
     static func disabledAddonIDs() -> Set<String> {
         guard let data = ProfileSettings.current.data(forKey: SettingsKey.homeCatalogDisabledAddonIDs),
-              let ids = try? JSONDecoder().decode([String].self, from: data) else { return [] }
-        return Set(ids)
+              let ids = try? JSONDecoder().decode([String].self, from: data) else { return homeHiddenAddonIDs() }
+        return Set(ids).union(homeHiddenAddonIDs())
+    }
+
+    /// Enabled add-ons whose catalogs stay off Home, for example a stream
+    /// add-on that repeats the catalogs of the metadata add-on. Kept apart from
+    /// `homeCatalogDisabledAddonIDs`, which Settings rebuilds from disabled add-ons.
+    static func homeHiddenAddonIDs(in settings: UserDefaults = ProfileSettings.current) -> Set<String> {
+        Set(settings.stringArray(forKey: SettingsKey.homeHiddenAddonIDs) ?? [])
+    }
+
+    static func setHomeHidden(_ hidden: Bool, addonID: String, in settings: UserDefaults = ProfileSettings.current) {
+        var ids = homeHiddenAddonIDs(in: settings)
+        if hidden { ids.insert(addonID) } else { ids.remove(addonID) }
+        if ids.isEmpty {
+            settings.removeObject(forKey: SettingsKey.homeHiddenAddonIDs)
+        } else {
+            settings.set(ids.sorted(), forKey: SettingsKey.homeHiddenAddonIDs)
+        }
     }
 
     static func disabledAddonNames() -> Set<String> {

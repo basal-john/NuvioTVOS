@@ -147,6 +147,7 @@ enum SettingsKey {
     /// an add-on is disabled before Home has rebuilt its snapshot.
     static let homeCatalogDisabledAddonIDs = "nuvio.tv.settings.layout.homeCatalogDisabledAddonIDs"
     static let homeCatalogDisabledAddonNames = "nuvio.tv.settings.layout.homeCatalogDisabledAddonNames"
+    static let homeHiddenAddonIDs = "nuvio.tv.settings.layout.homeHiddenAddonIDs"
     /// Collection ids hidden from Home via the account layout sync.
     static let homeCollectionDisabled = "nuvio.tv.settings.layout.homeCollectionDisabled"
     /// JSON `[String]` of account catalog keys (`<addonId>_<type>_<catalogId>`)
@@ -316,6 +317,7 @@ enum SettingsKey {
     static let jellyfinServers = "nuvio.tv.settings.integrations.jellyfinServers"
     static let jellyfinLibraryIndex = "nuvio.tv.settings.integrations.jellyfinLibraryIndex"
     static let jellyfinLocalRowEnabled = "nuvio.tv.settings.integrations.jellyfinLocalRowEnabled"
+    static let jellyfinStreamSourceEnabled = "nuvio.tv.settings.integrations.jellyfinStreamSourceEnabled"
     static let plexServers = "nuvio.tv.settings.integrations.plexServers"
     static let plexAccountName = "nuvio.tv.settings.integrations.plexAccountName"
     static let plexLocalRowEnabled = "nuvio.tv.settings.integrations.plexLocalRowEnabled"
@@ -344,6 +346,7 @@ enum SettingsKey {
     static let backgroundStreamPreFetch = "nuvio.tv.settings.playback.backgroundStreamPreFetch"
     static let cachedOnlyStreams = "nuvio.tv.settings.playback.cachedOnlyStreams"
     static let preferHardwareDecodedStreams = "nuvio.tv.settings.playback.preferHardwareDecodedStreams"
+    static let preferTorBoxStreams = "nuvio.tv.settings.playback.preferTorBoxStreams"
     static let preserveAddonStreamOrder = "nuvio.tv.settings.playback.preserveAddonStreamOrder"
     static let streamSortOption = "nuvio.tv.settings.playback.streamSortOption"
     /// Local picker preference; the shared stream sort contract does not know this mode.
@@ -495,11 +498,11 @@ enum SettingsKey {
         streamAddonManifestStates,
         cinemetaDisabled, deletedLocalAddons,
         smbServers, smbLibraryIndex, smbLocalRowEnabled,
-        jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
+        jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled, jellyfinStreamSourceEnabled,
         plexServers, plexAccountName, plexLocalRowEnabled,
         playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, foldsDolbyVisionFEL, preferHDR10Plus, lowResUpscaling, upscaleScaler, losslessAudioBridge, preserveSubwooferBassInStereo, loudnessNormalizer, loudnessTargetPreset, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
-        cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
+        cachedOnlyStreams, preferHardwareDecodedStreams, preferTorBoxStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused, streamListHideFileSize,
         streamListHideAddonName, streamListHideDescription,
         streamListDetailSize, streamListBadgeSize, streamListLogoSize, streamListSpacing, streamListHeight,
@@ -5868,6 +5871,16 @@ private struct IntegrationSettingsView: View {
                         isOn: Binding(
                             get: { RemoteTrackingState.isScrobbleEnabled(for: .jellyfin) },
                             set: { RemoteTrackingState.setScrobbleEnabled($0, for: .jellyfin) }
+                        ),
+                        accentColor: accentColor
+                    )
+
+                    SettingsToggleRow(
+                        title: L10n.string("tvos_settings_jellyfin_stream_source", fallback: "Jellyfin Sources"),
+                        subtitle: L10n.string("tvos_settings_jellyfin_stream_source_subtitle", fallback: "Offer Jellyfin library files as playback sources next to add-on streams"),
+                        isOn: Binding(
+                            get: { JellyfinStreamSourceSettings.isEnabled() },
+                            set: { JellyfinStreamSourceSettings.setEnabled($0) }
                         ),
                         accentColor: accentColor
                     )
@@ -11717,6 +11730,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.smartSubtitleMatching) private var smartSubtitleMatching = true
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnlyStreams = false
     @AppStorage(SettingsKey.preferHardwareDecodedStreams) private var preferHardwareDecodedStreams = true
+    @AppStorage(SettingsKey.preferTorBoxStreams) private var preferTorBoxStreams = true
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonStreamOrder = false
     @AppStorage(SettingsKey.streamSortOption) private var streamSortOption = StreamSortOption.quality.rawValue
     @AppStorage(SettingsKey.recommendedStreamSort) private var recommendedStreamSort = false
@@ -12529,6 +12543,13 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_prefer_hardware_codecs", fallback: "Prefer Hardware Decoded Streams"),
                     subtitle: L10n.string("tvos_settings_prefer_hardware_codecs_subtitle", fallback: "Prioritize HEVC and H.264 streams over AV1 for 4K content to prevent high CPU load (300%+), reduce heat, and ensure native Dolby Vision and HDR support on Apple TV"),
                     isOn: $preferHardwareDecodedStreams,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_prefer_torbox_streams", fallback: "Prefer TorBox Streams"),
+                    subtitle: L10n.string("tvos_settings_prefer_torbox_streams_subtitle", fallback: "Auto-select picks a TorBox link over other services at the same resolution, so seeking starts faster"),
+                    isOn: $preferTorBoxStreams,
                     accentColor: accentColor
                 )
 
@@ -14280,6 +14301,7 @@ private struct AdvancedSettingsView: View {
         ProfileSettings.resetTrailerSoundPreference(in: defaults)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonIDs)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonNames)
+        defaults.removeObject(forKey: SettingsKey.homeHiddenAddonIDs)
         AISubtitleKeyStore.remove()
         Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: ProfileSettings.activeProfileScope) }
     }

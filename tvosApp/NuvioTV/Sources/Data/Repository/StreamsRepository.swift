@@ -371,6 +371,7 @@ final class StreamsRepository: ObservableObject {
         season: Int? = nil,
         episode: Int? = nil
     ) -> [JellyfinStreamTarget] {
+        guard JellyfinStreamSourceSettings.isEnabled() else { return [] }
         let contentId = Self.baseContentId(from: videoId)
         let resolvedEpisode = (season == nil && episode == nil)
             ? Self.seasonEpisode(fromVideoId: videoId)

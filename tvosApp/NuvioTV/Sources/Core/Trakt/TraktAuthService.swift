@@ -1075,7 +1075,8 @@ enum RemoteTrackingState {
     static func activeScrobbleSources(
         in store: UserDefaults = ProfileSettings.current
     ) -> [TraktWatchProgressSource] {
-        TraktWatchProgressSource.allCases.filter { source in
+        JellyfinStreamSourceSettings.migrateIfNeeded(in: store)
+        return TraktWatchProgressSource.allCases.filter { source in
             isScrobbleEnabled(for: source, in: store)
         }
     }

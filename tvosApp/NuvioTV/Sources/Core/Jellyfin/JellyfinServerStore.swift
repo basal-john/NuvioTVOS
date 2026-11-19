@@ -57,3 +57,33 @@ final class JellyfinServerStore: ObservableObject {
         return servers
     }
 }
+
+/// Profile setting that decides whether configured Jellyfin servers are offered
+/// as playback sources. Off by default, so add-on streams are the only sources
+/// while the Jellyfin account keeps serving Continue Watching and watch progress.
+///
+/// A Jellyfin server records progress by itself only for files it serves. With
+/// Jellyfin sources off, the app must report progress, so turning sources off
+/// also turns on Jellyfin Scrobble when Jellyfin is the Continue Watching source.
+enum JellyfinStreamSourceSettings {
+    static func isEnabled(in store: UserDefaults = ProfileSettings.current) -> Bool {
+        store.object(forKey: SettingsKey.jellyfinStreamSourceEnabled) as? Bool ?? false
+    }
+
+    static func setEnabled(_ enabled: Bool, in store: UserDefaults = ProfileSettings.current) {
+        store.set(enabled, forKey: SettingsKey.jellyfinStreamSourceEnabled)
+        if !enabled { enableScrobbleIfJellyfinIsProgressSource(in: store) }
+    }
+
+    /// Applies the default once per profile: sources off, scrobble on.
+    static func migrateIfNeeded(in store: UserDefaults = ProfileSettings.current) {
+        guard store.object(forKey: SettingsKey.jellyfinStreamSourceEnabled) == nil else { return }
+        store.set(false, forKey: SettingsKey.jellyfinStreamSourceEnabled)
+        enableScrobbleIfJellyfinIsProgressSource(in: store)
+    }
+
+    private static func enableScrobbleIfJellyfinIsProgressSource(in store: UserDefaults) {
+        guard TraktSettingsStore.watchProgressSource(in: store) == .jellyfin else { return }
+        store.set(true, forKey: SettingsKey.jellyfinScrobbleEnabled)
+    }
+}
