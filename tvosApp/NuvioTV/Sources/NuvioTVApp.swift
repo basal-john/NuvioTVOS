@@ -6148,7 +6148,7 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.tmdbUseBasicInfo) private var tmdbUseBasicInfo = true
     @AppStorage(SettingsKey.tmdbApplyToHome) private var tmdbApplyToHome = false
     @AppStorage(SettingsKey.smbLocalRowEnabled) private var smbLocalRowEnabled = true
-    @AppStorage(SettingsKey.jellyfinLocalRowEnabled) private var jellyfinLocalRowEnabled = true
+    @AppStorage(SettingsKey.jellyfinLocalRowEnabled) private var jellyfinLocalRowEnabled = false
     @AppStorage(SettingsKey.plexLocalRowEnabled) private var plexLocalRowEnabled = true
     @AppStorage(SettingsKey.catalogAutoRefreshInterval) private var catalogAutoRefreshInterval = "30 Minutes"
     @Environment(\.scenePhase) private var scenePhase
